@@ -16,7 +16,6 @@ path('connect/', SocketView.as_view(), name='connect'),
     path('trigger_push/', trigger_push, name='trigger_push'),  # 添加该路由
     path('stop-simulation/', SocketView.as_view(), name='stop_simulation'),  # 添加该路由
 
-
     path('api/addSceneList', views.add_scene_list, name='add_scene_list'),
     path('api/deleteSceneList/<int:scene_id>', views.delete_scene_list, name='delete_scene_list'),
     path('api/editSceneList/<int:scene_id>', views.edit_scene_list, name='edit_scene_list'),

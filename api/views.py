@@ -1064,88 +1064,22 @@ def get_node_list(request):
         node_list = []
         for node in page_obj:
             interfaces = node.interfaces.all().order_by('interfaceIndex')
-            raw_details = node.details or []
 
-            # 修复错误格式的数据
-            if len(raw_details) == 1 and raw_details[0].startswith('['):
-                try:
-                    # 尝试解析为数组
-                    details_array = json.loads(raw_details[0])
-                    # 转换为正确的存储格式
-                    fixed_details = [json.dumps(item) for item in details_array]
-                    raw_details = fixed_details
-
-                    # 更新数据库（可选）
-                    node.details = fixed_details
-                    node.save()
-                except json.JSONDecodeError:
-                    # 记录错误但不中断处理
-                    logger.warning(f"Failed to fix details format for node {node.id}")
-
-            # 初始化details列表（存储JSON字符串）
+            # 保持原始 details 中每个接口的 JSON 字符串，不进行解析或修复
             details_list = []
-
-            # 获取第一个接口的完整配置作为模板
-            template_config = {}
-            if raw_details:
+            for interface in interfaces:
                 try:
-                    # 解析第一个接口的配置
-                    template_config = json.loads(raw_details[0])
+                    # 确保是 JSON 对象，转成带反斜杠的字符串
+                    detail_obj = interface.detail
+                    if isinstance(detail_obj, str):
+                        # 如果已经是字符串，先转成 dict
+                        detail_obj = json.loads(detail_obj)
+                    json_str = json.dumps(detail_obj)  # 会自动加 \ 转义
+                    details_list.append(json_str)
+                except Exception as e:
+                    logger.warning(f"接口 {interface.id} 的 detail 转换失败: {e}")
+                    details_list.append("{}")  # 保底返回空 JSON
 
-                    # 确保所有部分都存在
-                    sections = ["Physical", "MAC", "Network", "Routing",
-                                "Application", "Faults", "File"]
-                    for section in sections:
-                        if section not in template_config:
-                            template_config[section] = {}
-                except (json.JSONDecodeError, TypeError):
-                    # 如果解析失败，创建空模板
-                    template_config = {}
-
-            for idx, interface in enumerate(interfaces):
-                # 复制模板配置作为基础
-                interface_config = copy.deepcopy(template_config)
-
-                # 尝试获取当前接口的存储配置
-                if idx < len(raw_details) and raw_details[idx]:
-                    try:
-                        # 解析为字典
-                        stored_config = json.loads(raw_details[idx])
-
-                        # 合并存储配置（覆盖模板）
-                        for key, value in stored_config.items():
-                            if isinstance(value, dict):
-                                # 如果是字典，则合并字典
-                                if key not in interface_config:
-                                    interface_config[key] = {}
-                                interface_config[key].update(value)
-                            else:
-                                # 如果是其他类型，直接覆盖
-                                interface_config[key] = value
-                    except (json.JSONDecodeError, TypeError) as e:
-                        # 记录解析错误
-                        logger.warning(f"JSON decode error for node {node.id}, interface {idx}: {str(e)}")
-
-                # 确保所有部分都存在
-                sections = ["Physical", "MAC", "Network", "Routing",
-                            "Application", "Faults", "File"]
-                for section in sections:
-                    if section not in interface_config:
-                        interface_config[section] = {}
-
-                # 更新IP信息
-                if "Network" not in interface_config:
-                    interface_config["Network"] = {}
-
-                interface_config["Network"].update({
-                    "IPv4Address": interface.interfaceIp,
-                    "IPv4SubnetMask": interface.subnetMask
-                })
-
-                # 将字典转换为JSON字符串
-                details_list.append(json.dumps(interface_config))
-
-            # 构建节点数据（details使用JSON字符串列表）
             node_data = {
                 'sceneId': node.sceneId.id if node.sceneId else None,
                 'id': node.id,
@@ -1163,7 +1097,7 @@ def get_node_list(request):
                 'raan': node.raan,
                 'startTime': node.startTime.isoformat() if node.startTime else None,
                 'viaPoints': node.viaPoints if node.viaPoints else [],
-                'details': details_list,  # JSON字符串列表
+                'details': details_list  # ⬅️ 接口 detail 的 JSON 字符串数组
             }
             node_list.append(node_data)
 
@@ -1191,6 +1125,7 @@ def get_node_list(request):
         import traceback
         logger.error(f"Error in get_node_list: {str(e)}\n{traceback.format_exc()}")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
 @csrf_exempt
 @require_http_methods(["PUT"])
 def edit_node_list(request, node_id):
@@ -1252,11 +1187,32 @@ def edit_node_list(request, node_id):
         else:
             return JsonResponse({'status': 'error', 'message': 'Invalid node type'}, status=400)
 
-        # 处理 details 字段
+        # 处理 details 字段,#还没有处理接口ip。
         if 'details' in data:
-            node.details = data['details']
-        else:
-            node.details =node.details
+            details = data['details']
+            interfaces = list(node.interfaces.all().order_by('interfaceIndex'))
+
+            if not isinstance(details, list):
+                return JsonResponse({'status': 'error', 'message': 'details must be a list'}, status=400)
+
+            if len(details) != len(interfaces):
+                return JsonResponse({
+                    'status': 'error',
+                    'message': f'Details count ({len(details)}) does not match interface count ({len(interfaces)})'
+                }, status=400)
+
+            # 更新每个接口的 detail 字段
+            for i, interface in enumerate(interfaces):
+                try:
+                    json.loads(details[i])  # 检查是否为合法 JSON 字符串
+                except json.JSONDecodeError:
+                    return JsonResponse({
+                        'status': 'error',
+                        'message': f'Invalid JSON at details index {i}'
+                    }, status=400)
+
+                interface.detail = details[i]
+                interface.save(update_fields=['detail'])
         node.save()
         return JsonResponse({'status': 'success'})
 
@@ -1264,6 +1220,7 @@ def edit_node_list(request, node_id):
         return JsonResponse({'status': 'error', 'message': 'Invalid JSON format'}, status=400)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
 @require_http_methods(["DELETE"])
 @csrf_exempt
 def delete_node_list(request, node_id):

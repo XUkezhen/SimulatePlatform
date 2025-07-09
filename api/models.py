@@ -147,6 +147,100 @@ class Subnet(models.Model):
     def __str__(self):
         return self.subnetName
 
+DEFAULT_INTERFACE_DETAIL = {
+    "Physical": {
+        "ListenableChannel": "Channel1",
+        "ListeningChannel": "Channel1",
+        "Radiotype": "802.11bRadio",
+        "RadioOverlayID": "[Optional]",
+        "EnableAutoRateFallback": "No",
+        "DataRata": "2Mbps",
+        "FrequencyBand": "2.4GHz",
+        "CountryCode": "SpecifyWiFiCountryProfilesFileinScenarioPropertiesEditorSupplementalFiles",
+        "ChannelIndexfor20MHz": "6",
+        "TransmissionPowerat1Mbps": "15.0",
+        "TransmissionPowerat2Mbps": "15.0",
+        "TransmissionPowerat55Mbps": "15.0",
+        "TransmissionPowerat11Mbps": "15.0",
+        "UseLegacy80211bPHYValues": "No",
+        "ReceiveSensitivityat1Mbps": "-82.0",
+        "ReceiveSensitivityat2Mbps": "-80.0",
+        "ReceiveSensitivityat55Mbps": "-78.0",
+        "ReceiveSensitivityat11Mbps": "-76.0",
+        "PacketReceptionModel": "PHY802.11aReceptionModel",
+        "SpecifyAntennaModelfromFile": "No",
+        "AntennaModel": "Omnidirectional",
+        "AntennaGain": "0.0",
+        "AntennaHeight": "1.5",
+        "AntennaEfficiency": "0.8",
+        "AntennaMismatchLoss": "0.3",
+        "AntennaCableLoss": "0.0",
+        "AntennaConnectionLoss": "0.2",
+        "AntennaOrientationAzimuth": "0",
+        "AntennaOrientationElevation": "0",
+        "AntennaOrientationRoll": "0",
+        "AntennaOrientationAzimuthSpeed": "0",
+        "Temperature": "290.0",
+        "NoiseFactor": "10.0",
+        "EnergyModel": "None"
+    },
+    "MAC": {
+        "MACProtocol": "802.11",
+        "ShortPacketTransmitLimit": "7",
+        "LongPacketTransmitLimit": "4",
+        "RTSThreshold": "0",
+        "StopReceivingafterHeaderMode": "No",
+        "StationAssociationType": "None",
+        "SecurityProtocol": "None",
+        "SpecifyNetworkSecurityParameters": "No",
+        "DatabaseControl": "NONE",
+        "MACPropagationDelay": "1",
+        "MACPropagationDelayTimeType": "microSeconds",
+        "EnablePromiscuousMode": "No",
+        "EnableLLC": "No",
+        "ConfigureMediaType": "No",
+        "ConfigureMACAddress": "No"
+    },
+    "Network": {
+        "NetworkProtocol": "IPv4",
+        "IPv4Address": "169.0.0.1",
+        "IPv4SubnetMask": "255.255.255.0",
+        "IPFragmentationUnit": "2048",
+        "EnableExplicitCongestionNotification": "No",
+        "EnableMobileIP": "No",
+        "IPInputQueueSize": "150000",
+        "IPOutputQueueScheduler": "StrictPriority",
+        "SpecifyPerHopBehaviorFile": "No",
+        "EnableIFFCertification": "No",
+        "EnableEavesdropping": "No",
+        "EnableARP": "No",
+        "EnableDHCP": "No",
+        "EnableDNS": "No",
+        "PacketDropProbability": "0.0",
+        "SpecifyPacketDelay": "No"
+    },
+    "Routing": {
+        "RoutingProtocolIPv4": "BellmanFord",
+        "EnableMulticast": "No",
+        "EnableHSRPProtocol": "No",
+        "EnableMulticastSourceDiscoveryProtocol": "No"
+    },
+    "Application": {
+        "EnableEmulatedFTP": "Yes",
+        "EnableEmulatedHTTP": "Yes",
+        "EnableEmulatedTELNET": "Yes"
+    },
+    "File": {
+        "PHYRadio": "Yes",
+        "MAC": "Yes",
+        "IPInputQueue": "Yes",
+        "IPInputScheduler": "No",
+        "IPOutputScheduler": "No",
+        "IPOutputSchedulergraph": "No"
+    },
+    "Faults": {}
+}
+
 class Interface(models.Model):
     class InterfaceTypeChoices(models.TextChoices):
         SUB = 'sub', 'Subnet Interface'
@@ -174,6 +268,11 @@ class Interface(models.Model):
         choices=InterfaceTypeChoices.choices,
         default=InterfaceTypeChoices.SUB,
         verbose_name="Interface Type"
+    )
+
+    detail = models.JSONField(
+        default=DEFAULT_INTERFACE_DETAIL,
+        verbose_name="Interface Detail"
     )
 
     class Meta:
@@ -214,6 +313,12 @@ class Interface(models.Model):
 
     def save(self, *args, **kwargs):
         self.clean()
+
+        if self.detail:
+            self.detail.setdefault('Network', {})
+            self.detail['Network']['IPv4Address'] = self.interfaceIp
+            self.detail['Network']['IPv4SubnetMask'] = self.subnetMask
+
         if self.is_default:
             Interface.objects.filter(
                 node=self.node,
