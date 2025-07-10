@@ -1190,6 +1190,9 @@ def edit_node_list(request, node_id):
         # 处理 details 字段,#还没有处理接口ip。
         if 'details' in data:
             details = data['details']
+            # 检查是否为列表
+            if not isinstance(details, list):  # 条件成立（字符串不是列表）
+                return JsonResponse({'status': 'error', 'message': 'details must be a list'}, status=400)
             interfaces = list(node.interfaces.all().order_by('interfaceIndex'))
 
             if not isinstance(details, list):
@@ -1203,14 +1206,13 @@ def edit_node_list(request, node_id):
 
             # 更新每个接口的 detail 字段
             for i, interface in enumerate(interfaces):
-                try:
-                    json.loads(details[i])  # 检查是否为合法 JSON 字符串
-                except json.JSONDecodeError:
-                    return JsonResponse({
-                        'status': 'error',
-                        'message': f'Invalid JSON at details index {i}'
-                    }, status=400)
-
+                # try:
+                #     json.loads(details[i])  # 检查是否为合法 JSON 字符串
+                # except json.JSONDecodeError:
+                #     return JsonResponse({
+                #         'status': 'error',
+                #         'message': f'Invalid JSON at details index {i}'
+                #     }, status=400)
                 interface.detail = details[i]
                 interface.save(update_fields=['detail'])
         node.save()
