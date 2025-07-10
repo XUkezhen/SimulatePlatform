@@ -645,7 +645,7 @@ def edit_subnet_list(request, subnet_id):
 
                 # ... 后面的代码保持不变 ...
 
-                # === 批量处理默认子网的IP分配 ===
+                # === 批量处理默认子网的IP分配 ===  感觉用不到这些
                 # 为移动到默认子网的节点分配IP（批量操作提高效率）
                 if default_subnet and nodes_to_remove:
                     # 获取默认子网的网络配置
@@ -1808,7 +1808,8 @@ def edit_link_list(request, link_id):
                     # 检查IP是否已被占用（排除当前接口）
                     if Interface.objects.filter(
                             interfaceIp=source_interface_ip,
-                            subnetMask=subnet_mask
+                            subnetMask=subnet_mask,
+
                     ).exclude(id=link.sourceInterface.id).exists():
                         return JsonResponse(
                             {'status': 'error', 'message': f'源IP地址 {source_interface_ip} 已被占用'},
@@ -1965,12 +1966,11 @@ def delete_link_list(request, link_id):
             def maintain_node(node):
                 """维护节点接口状态"""
                 # 重新排列接口索引（批量更新优化）
-                interfaces = list(node.interfaces.order_by('id'))
-                Interface.objects.bulk_update(
-                    [Interface(id=i.id, interfaceIndex=idx) for idx, i in enumerate(interfaces)],
-                    ['interfaceIndex']
-                )
-
+                # interfaces = list(node.interfaces.order_by('id'))
+                # Interface.objects.bulk_update(
+                #     [Interface(id=i.id, interfaceIndex=idx) for idx, i in enumerate(interfaces)],
+                #     ['interfaceIndex']
+                # )
                 # 检查并创建默认接口
                 if not node.interfaces.exists():
                     create_default_interface(node)
