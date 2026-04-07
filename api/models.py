@@ -27,7 +27,15 @@ class Scene(models.Model):
     startTime = models.DateTimeField()
     endTime = models.DateTimeField()
     simulationStep = models.IntegerField()  # 新增仿真步长字段
-
+    COORDINATE_CHOICES = [
+        ('CARTESIAN', 'Cartesian'),#大写是写入数据库的，小写是展示用的
+        ('LATLONALT', 'LatLonAlt'),
+    ]
+    coordinateSystem = models.CharField(
+        max_length=20,
+        choices=COORDINATE_CHOICES,
+        default='LATLONALT',
+    )
     def __str__(self):
         return self.sceneName
 
@@ -43,7 +51,6 @@ class Scene(models.Model):
         # 验证场景名称唯一
         if Scene.objects.filter(sceneName=self.sceneName).exclude(id=self.id).exists():
             raise ValidationError("Scene name must be unique")
-
         return super().clean()
 
     def save(self, *args, **kwargs):
@@ -56,7 +63,7 @@ class Node(models.Model):
         ('satellite', 'Satellite'),
         ('normalNode', 'Normal Node'),
     ]
-
+    #外键，第一个参数是指向哪个模型（和谁关联），on_delete是指删除，级联、受保护等等。字符类
     sceneId = models.ForeignKey('Scene', on_delete=models.CASCADE, related_name='nodes', null=True, blank=True)
     nodeName = models.CharField(max_length=255)
     nodeImage = models.CharField(max_length=255)
@@ -67,7 +74,14 @@ class Node(models.Model):
     lat = models.FloatField(null=True, blank=True)
     alt = models.FloatField(null=True, blank=True)
     startTime = models.DateTimeField(null=True, blank=True)
-
+    # 新增字段
+    specialType = models.CharField(
+        max_length=20,
+        null=True,
+        blank=True,
+        default=None,
+        verbose_name="特殊节点类型"
+    )
     # satellite 特有字段
     eccentricity = models.FloatField(null=True, blank=True)  # 偏心率
     argPerigee = models.FloatField(null=True, blank=True)     # 近地点幅角
@@ -89,42 +103,91 @@ class Node(models.Model):
     def clean(self):
         # 验证节点类型特定字段
         if self.nodeType == 'satellite':
-            if not all([self.eccentricity, self.argPerigee, self.inclination,
-                        self.meanAnomaly, self.meanMotion, self.raan, self.startTime]):
+            required_fields = [
+                self.eccentricity, self.argPerigee, self.inclination,
+                self.meanAnomaly, self.meanMotion, self.raan, self.startTime
+            ]
+            if any(field is None for field in required_fields):
                 raise ValidationError("Satellite nodes require all orbital elements and startTime.")
+
         elif self.nodeType == 'normalNode':
-            if not all([self.lon, self.lat, self.alt, self.startTime]):
+            required_fields = [self.lon, self.lat, self.alt, self.startTime]
+            if any(field is None for field in required_fields):
                 raise ValidationError("Normal nodes require lon, lat, alt, and startTime.")
+
             if self.viaPoints:
                 try:
-                    # 验证 viaPoints 格式
                     if not isinstance(self.viaPoints, list):
                         raise ValidationError("viaPoints must be a JSON list of points.")
                     for point in self.viaPoints:
                         if not isinstance(point, dict):
                             raise ValidationError("Each viaPoint must be a dictionary.")
-                        if 'lon' not in point or 'lat' not in point or 'alt' not in point or 'time' not in point:
+                        if any(k not in point for k in ['lon', 'lat', 'alt', 'time']):
                             raise ValidationError("Each viaPoint must contain 'lon', 'lat', 'alt', and 'time'.")
                 except (TypeError, ValueError):
                     raise ValidationError("viaPoints must be valid JSON.")
+
+
 class Configuration(models.Model):
     BUSINESS_TYPE_CHOICES = (
         ('CBR', 'CBR'),
         ('FTP', 'FTP'),
+        ('TRAFFIC-GEN', 'TRAFFIC-GEN'),
+        ('HTTP', 'HTTP'),
     )
+
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='configurations', default=12)
-    businessType = models.CharField(max_length=10, choices=BUSINESS_TYPE_CHOICES,default='CBR')
+    businessType = models.CharField(max_length=20, choices=BUSINESS_TYPE_CHOICES, default='CBR')
     businessName = models.CharField(max_length=255)
-    sourceNodeId = models.ForeignKey(Node, on_delete=models.CASCADE, related_name='source_configurations')
-    destinationNodeId = models.ForeignKey(Node, on_delete=models.CASCADE, related_name='destination_configurations')
-    # CBR 业务类型的详细配置
-    cbrStartTime = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
-    cbrEndTime = models.DateTimeField(null=True, blank=True, verbose_name='结束时间')
-    cbrSendInterval = models.IntegerField(null=True, blank=True, verbose_name='发送间隔')
-    cbrPacketSize = models.IntegerField(null=True, blank=True, verbose_name='发送包大小')
-    # FTP 业务类型的详细配置
-    ftpStartTime = models.DateTimeField(null=True, blank=True, verbose_name='开始时间')
-    ftpPacketCount = models.IntegerField(null=True, blank=True, verbose_name='发送包的数量')
+
+    # 通用的源/目的节点，仅适用于非 HTTP 类型
+    sourceNodeId = models.ForeignKey(
+        Node,
+        on_delete=models.CASCADE,
+        related_name='source_configurations',
+        null=True, blank=True
+    )
+    destinationNodeId = models.ForeignKey(
+        Node,
+        on_delete=models.CASCADE,
+        related_name='destination_configurations',
+        null=True, blank=True
+    )
+
+    # ========== CBR 配置 ==========
+    cbrStartTime = models.DateTimeField(null=True, blank=True, verbose_name='CBR开始时间')
+    cbrEndTime = models.DateTimeField(null=True, blank=True, verbose_name='CBR结束时间')
+    cbrSendInterval = models.IntegerField(null=True, blank=True, verbose_name='CBR发送间隔（ms）')
+    cbrPacketSize = models.IntegerField(null=True, blank=True, verbose_name='CBR包大小（Bytes）')
+    TransferType = models.CharField(null = True,blank= True,default= 'ID',max_length= 2)
+    # ========== FTP 配置 ==========
+    ftpStartTime = models.DateTimeField(null=True, blank=True, verbose_name='FTP开始时间')
+    ftpPacketCount = models.IntegerField(null=True, blank=True, verbose_name='FTP包数量')
+
+    # ========== TRAFFIC-GEN 配置 ==========
+    tgStartTime = models.FloatField(null=True, blank=True, verbose_name='Traffic-Gen开始时间（s）')
+    tgDurationTime = models.FloatField(null=True, blank=True, verbose_name='Traffic-Gen持续时间（s）')
+    tgPacketSize = models.IntegerField(null=True, blank=True, verbose_name='Traffic-Gen包大小（Bytes）')
+    tgSendInterval = models.FloatField(null=True, blank=True, verbose_name='Traffic-Gen发送间隔（s）')
+
+    # ========== HTTP 配置 ==========
+    clientId = models.ForeignKey(
+        Node,
+        on_delete=models.CASCADE,
+        related_name='http_clients',
+        null=True, blank=True,
+        verbose_name='HTTP客户端节点'
+    )
+    serverList = models.JSONField(
+        null=True, blank=True,
+        verbose_name='HTTP服务器节点列表（节点ID列表）'
+    )
+    httpStartTime = models.FloatField(null=True, blank=True, verbose_name='HTTP开始时间（s）')
+    httpThreshTime = models.FloatField(null=True, blank=True, verbose_name='HTTP阈值时间（s）')
+
+    def __str__(self):
+        return f'{self.businessType} - {self.businessName}'
+
 
 
 class Subnet(models.Model):
@@ -136,7 +199,7 @@ class Subnet(models.Model):
     subnetName = models.CharField(max_length=255)
     subnetIp = models.GenericIPAddressField()
     subnetMask = models.GenericIPAddressField()
-
+    details = models.JSONField(null= True,blank= True)
     subnetType = models.CharField(
         max_length=10,
         choices=SubnetTypeChoices.choices,
@@ -148,97 +211,7 @@ class Subnet(models.Model):
         return self.subnetName
 
 DEFAULT_INTERFACE_DETAIL = {
-    "Physical": {
-        "ListenableChannel": "Channel1",
-        "ListeningChannel": "Channel1",
-        "Radiotype": "802.11bRadio",
-        "RadioOverlayID": "[Optional]",
-        "EnableAutoRateFallback": "No",
-        "DataRata": "2Mbps",
-        "FrequencyBand": "2.4GHz",
-        "CountryCode": "SpecifyWiFiCountryProfilesFileinScenarioPropertiesEditorSupplementalFiles",
-        "ChannelIndexfor20MHz": "6",
-        "TransmissionPowerat1Mbps": "15.0",
-        "TransmissionPowerat2Mbps": "15.0",
-        "TransmissionPowerat55Mbps": "15.0",
-        "TransmissionPowerat11Mbps": "15.0",
-        "UseLegacy80211bPHYValues": "No",
-        "ReceiveSensitivityat1Mbps": "-82.0",
-        "ReceiveSensitivityat2Mbps": "-80.0",
-        "ReceiveSensitivityat55Mbps": "-78.0",
-        "ReceiveSensitivityat11Mbps": "-76.0",
-        "PacketReceptionModel": "PHY802.11aReceptionModel",
-        "SpecifyAntennaModelfromFile": "No",
-        "AntennaModel": "Omnidirectional",
-        "AntennaGain": "0.0",
-        "AntennaHeight": "1.5",
-        "AntennaEfficiency": "0.8",
-        "AntennaMismatchLoss": "0.3",
-        "AntennaCableLoss": "0.0",
-        "AntennaConnectionLoss": "0.2",
-        "AntennaOrientationAzimuth": "0",
-        "AntennaOrientationElevation": "0",
-        "AntennaOrientationRoll": "0",
-        "AntennaOrientationAzimuthSpeed": "0",
-        "Temperature": "290.0",
-        "NoiseFactor": "10.0",
-        "EnergyModel": "None"
-    },
-    "MAC": {
-        "MACProtocol": "802.11",
-        "ShortPacketTransmitLimit": "7",
-        "LongPacketTransmitLimit": "4",
-        "RTSThreshold": "0",
-        "StopReceivingafterHeaderMode": "No",
-        "StationAssociationType": "None",
-        "SecurityProtocol": "None",
-        "SpecifyNetworkSecurityParameters": "No",
-        "DatabaseControl": "NONE",
-        "MACPropagationDelay": "1",
-        "MACPropagationDelayTimeType": "microSeconds",
-        "EnablePromiscuousMode": "No",
-        "EnableLLC": "No",
-        "ConfigureMediaType": "No",
-        "ConfigureMACAddress": "No"
-    },
-    "Network": {
-        "NetworkProtocol": "IPv4",
-        "IPv4Address": "169.0.0.1",
-        "IPv4SubnetMask": "255.255.255.0",
-        "IPFragmentationUnit": "2048",
-        "EnableExplicitCongestionNotification": "No",
-        "EnableMobileIP": "No",
-        "IPInputQueueSize": "150000",
-        "IPOutputQueueScheduler": "StrictPriority",
-        "SpecifyPerHopBehaviorFile": "No",
-        "EnableIFFCertification": "No",
-        "EnableEavesdropping": "No",
-        "EnableARP": "No",
-        "EnableDHCP": "No",
-        "EnableDNS": "No",
-        "PacketDropProbability": "0.0",
-        "SpecifyPacketDelay": "No"
-    },
-    "Routing": {
-        "RoutingProtocolIPv4": "BellmanFord",
-        "EnableMulticast": "No",
-        "EnableHSRPProtocol": "No",
-        "EnableMulticastSourceDiscoveryProtocol": "No"
-    },
-    "Application": {
-        "EnableEmulatedFTP": "Yes",
-        "EnableEmulatedHTTP": "Yes",
-        "EnableEmulatedTELNET": "Yes"
-    },
-    "File": {
-        "PHYRadio": "Yes",
-        "MAC": "Yes",
-        "IPInputQueue": "Yes",
-        "IPInputScheduler": "No",
-        "IPOutputScheduler": "No",
-        "IPOutputSchedulergraph": "No"
-    },
-    "Faults": {}
+
 }
 
 class Interface(models.Model):
@@ -270,9 +243,20 @@ class Interface(models.Model):
         verbose_name="Interface Type"
     )
 
+    @property
+    def links(self): #通过接口，直接查到它关联的链路
+        result = []
+        if hasattr(self, "source_link"):
+            result.append(self.source_link)
+        if hasattr(self, "destination_link"):
+            result.append(self.destination_link)
+        return result
+
     detail = models.JSONField(
         default=DEFAULT_INTERFACE_DETAIL,
-        verbose_name="Interface Detail"
+        verbose_name="Interface Detail",
+        null=True,
+        blank=True
     )
 
     class Meta:
@@ -285,7 +269,8 @@ class Interface(models.Model):
         return f"{self.node.nodeName} - Interface {self.interfaceIndex} ({self.interfaceIp}/{self.subnetMask})"
 
     def clean(self):
-        if self.interfaceIndex is not None and (self.interfaceIndex < 0 or self.interfaceIndex > 3):
+        if self.interfaceIndex is not None and (self.interfaceIndex < 0 ):
+            # 不局限于4个
             raise ValidationError("Interface index must be between 0 and 3")
 
         if self.subnetMask:
@@ -313,12 +298,6 @@ class Interface(models.Model):
 
     def save(self, *args, **kwargs):
         self.clean()
-
-        if self.detail:
-            self.detail.setdefault('Network', {})
-            self.detail['Network']['IPv4Address'] = self.interfaceIp
-            self.detail['Network']['IPv4SubnetMask'] = self.subnetMask
-
         if self.is_default:
             Interface.objects.filter(
                 node=self.node,
@@ -336,6 +315,7 @@ class Interface(models.Model):
                 iface.interfaceIndex = i
                 iface.save(update_fields=['interfaceIndex'])
 
+
 class Link(models.Model):
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE)
     LINK_TYPE_CHOICES = [
@@ -346,8 +326,8 @@ class Link(models.Model):
     sourceNodeId = models.ForeignKey(Node, on_delete=models.CASCADE, related_name='source_links')
     destinationNodeId = models.ForeignKey(Node, on_delete=models.CASCADE, related_name='destination_links')
     linkType = models.CharField(max_length=50, choices=LINK_TYPE_CHOICES)
-    bandwidth = models.FloatField(verbose_name='带宽(Mbps)')
-    packetHeaderSize = models.IntegerField(verbose_name='包头大小(Byte)')
+    bandwidth = models.FloatField(verbose_name='带宽(Mbps)', null=True, blank=True)
+    packetHeaderSize = models.IntegerField(verbose_name='包头大小(Byte)', null=True, blank=True)
     transmissionDelay = models.FloatField(verbose_name='传输延迟(ms)', null=True, blank=True)
     packetLossRate = models.FloatField(verbose_name='丢包率(%)', null=True, blank=True)
     transmissionSpeed = models.FloatField(verbose_name='传输速度(Mb/s)', null=True, blank=True)
@@ -356,7 +336,8 @@ class Link(models.Model):
     sourceInterface = models.OneToOneField(Interface, on_delete=models.CASCADE, related_name='source_link', null=True, blank=True)
     destinationInterface = models.OneToOneField(Interface, on_delete=models.CASCADE, related_name='destination_link', null=True, blank=True)
     subnet = models.ForeignKey(Subnet, on_delete=models.CASCADE, related_name='links', null=True, blank=True)  # 关联子网
-
+    # 新增字段
+    linkConfig = models.BooleanField(default=True, null=True, blank=True,verbose_name='链路是否启用配置')##判断是否需要从接口单独配置参数。
     def __str__(self):
         return f"{self.linkName} (Source: {self.sourceNodeId.nodeName}, Destination: {self.destinationNodeId.nodeName})"
 
@@ -375,6 +356,14 @@ class Link(models.Model):
 
         # Step 3: 删除链路自身
         super().delete(*args, **kwargs)
+
+class SlotTable(models.Model):
+    scene = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name="slot_tables")
+    data = models.JSONField()
+
+    def __str__(self):
+        return f"SlotTable {self.id} for Scene {self.scene.name}"
+
 class Error(models.Model):
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='nodeerrors', default=12)
     nodeId = models.ForeignKey(Node, on_delete=models.CASCADE, related_name='errors')
@@ -386,9 +375,7 @@ class LinkError(models.Model):
     linkId = models.ForeignKey(Link, on_delete=models.CASCADE, related_name='errors')
     errorStartTime = models.DateTimeField(null=True, blank=True, default='2025-01-16T01:00:00+00:00')
     errorEndTime = models.DateTimeField(null=True, blank=True, default='2025-01-16T01:00:00+00:00')
-    # linkName = models.CharField(max_length=255)
-    # sourceNodeName = models.CharField(max_length=255)  # 新增字段存储源节点名称
-    # destinationNodeName = models.CharField(max_length=255)  # 新增字段存储目的节点名称
+
 
 class NodeTemplate(models.Model):
     templateInfo = models.TextField()  # 节点信息

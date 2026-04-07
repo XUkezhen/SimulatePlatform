@@ -1,5 +1,6 @@
 from django.urls import path
 from . import views
+from . import exata_integration
 from .views import SocketView
 from .views import trigger_push  # 导入 trigger_push 视图函数
 
@@ -17,7 +18,7 @@ path('connect/', SocketView.as_view(), name='connect'),
     path('stop-simulation/', SocketView.as_view(), name='stop_simulation'),  # 添加该路由
 
     path('api/addSceneList', views.add_scene_list, name='add_scene_list'),
-    path('api/deleteSceneList/<int:scene_id>', views.delete_scene_list, name='delete_scene_list'),
+    path('api/deleteSceneList/<int:scene_id>', views.delete_scene_list, name='delete_scene_list'),#name用来重定向，reverse()
     path('api/editSceneList/<int:scene_id>', views.edit_scene_list, name='edit_scene_list'),
     path('api/getSceneList', views.get_scene_list, name='get_scene_list'),
     path('api/addSubnetList', views.add_subnet_list, name='add_subnet_list'),
@@ -70,9 +71,22 @@ path('connect/', SocketView.as_view(), name='connect'),
     # path('api/generatenodesFile/', views.generate_scene_nodes, name='generate_scene_nodes'),
     # path('api/generatefaultFile/', views.generate_scene_fault, name='generate_scene_fault'),
     # path('api/generatedisplayFile/', views.generate_display_file, name='generate_display_file'),
-    path('api/download_all_files/', views.download_all_files, name='download_all_files'),
-    path('api/analysis/', views.analysis_results, name='analysis-results'),
+    path('api/download_all_files', views.download_all_files, name='download_all_files'),
+    path('api/analysis', views.analysis_results, name='analysis-results'),
     path('api/get_scene_files/', views.get_scene_files, name='get_scene_files'),
-    path('api/startSimulation/', views.start_simulation, name='start_simulation'),
 
+    path('api/get_exata_scene_files', exata_integration.get_exata_scene_files, name='get_exata_scene_files_no_slash'),
+    path('api/get_exata_scene_files/', exata_integration.get_exata_scene_files, name='get_exata_scene_files'),
+    path('api/analyze_exata_stat', exata_integration.analyze_exata_stat, name='analyze_exata_stat_no_slash'),
+    path('api/analyze_exata_stat/', exata_integration.analyze_exata_stat, name='analyze_exata_stat'),
+    
+    path('api/startSimulation/', views.start_simulation, name='start_simulation'),
+    path('api/analyzeQueueData/', views.analyze_queue_data, name='analyze_queue_data'),
+    path('api/analyzeStatsData/', views.get_slot_stats_data, name='get_slot_stats_data'),
+    path('api/slotTable/', views.save_slot_table, name='save_slot_table'),
 ]
+#每个url对应返回唯一的结果
+#这是子应用中的url和视图函数对应，还需要把子应用注册到根url里
+"""
+RESTful 原则：URL 应该标识资源（名词），而不是操作（动词）。操作应该由 HTTP 方法（GET, POST, PUT, PATCH, DELETE）来表示。
+"""

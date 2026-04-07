@@ -1,31 +1,29 @@
-
+import shutil
+import sys
 from pathlib import Path
+
+from pk.django.core.cache import cache
+
 '''
 以下是lykcode
 '''
-import json
-import re
-import signal
+
 import socket
-import os
+
 import struct
 import time
 import threading
 import binascii
 
-import psutil
-from django.http import JsonResponse, HttpResponse
 from django.views import View
 from django.middleware.csrf import get_token
-from django.views.decorators.csrf import csrf_exempt
+
 from threading import Lock
 
 from .consumers import trigger_push
 
-from django.http import JsonResponse
 from channels.layers import get_channel_layer
 from asgiref.sync import async_to_sync
-
 # 以下软件包和sgp4相关
 from sgp4.api import Satrec, WGS72
 from sgp4.functions import jday
@@ -35,16 +33,10 @@ from datetime import datetime, timedelta
 from links import StaticDynamicLinkCalculator
 
 from runExata import ExataSimulator
-import os
+
 import subprocess
-import signal
-import psutil  # 需要先安装: pip install psutil
 
-
-import copy
-import ipaddress
 import json
-import re
 from pathlib import Path
 
 from django.core.exceptions import ObjectDoesNotExist
@@ -62,12 +54,15 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.decorators import api_view
 from datetime import datetime
-from .subnet_manager import SubnetManager, SubnetAllocationError, DefaultIPManager
 from ipaddress import IPv4Network, AddressValueError
 from django.shortcuts import get_object_or_404
 import os
-import shutil
+import re
+import glob
+from typing import List, Dict, Tuple
 from django.conf import settings
+from jinja2 import Environment, FileSystemLoader
+
 @require_http_methods(["POST"])
 @csrf_exempt
 def add_scene_list(request):
@@ -133,7 +128,7 @@ def add_scene_list(request):
             subnetName=f"{scene_name} (Default)",
             subnetIp="169.0.0.0",
             subnetMask="255.255.255.0",
-            subnetType = 'sub'
+            subnetType='sub'
         )
 
         # 成功响应
@@ -163,19 +158,31 @@ def add_scene_list(request):
             'message': f'Internal server error: {str(e)}'
         }, status=500)
 
+
 path = ""
 absolute_path = Path(path)
+
 
 @require_http_methods(["DELETE"])
 @csrf_exempt
 def delete_scene_list(request, scene_id):
     try:
         scene = Scene.objects.get(id=scene_id)
+        scene_name = scene.sceneName  # 取场景名
+        # 构造文件夹路径：项目根目录/scene_files/场景名
+        base_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'scene_files')#找到当前 app 的上一级目录，再拼接
+        scene_dir = os.path.join(base_dir, scene_name)
+        # 删除文件夹（如果存在）
+        if os.path.exists(scene_dir) and os.path.isdir(scene_dir):
+            shutil.rmtree(scene_dir)
+            logger.info(f"场景文件夹删除成功: {scene_dir}")  # ✅ 打印日志
+        # 删除数据库记录
         scene.delete()
         return JsonResponse({'status': 'success'})
     except Scene.DoesNotExist:
         return JsonResponse({'status': 'error', 'message': '场景不存在'}, status=404)
-
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
 @require_http_methods(["PUT"])
@@ -192,7 +199,7 @@ def edit_scene_list(request, scene_id):
         new_scene_name = data.get('sceneName', scene.sceneName)
         new_start_time = data.get('startTime', scene.startTime)
         new_end_time = data.get('endTime', scene.endTime)
-        new_simulation_step = data.get('simulationStep', scene.simulationStep)
+        new_simulation_step = int(data.get('simulationStep', scene.simulationStep))
 
         # 验证场景名称是否重复
         if Scene.objects.exclude(id=scene_id).filter(sceneName=new_scene_name).exists():
@@ -217,6 +224,7 @@ def edit_scene_list(request, scene_id):
         return JsonResponse({'status': 'error', 'message': 'Invalid JSON format'}, status=400)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
 
 @require_http_methods(["GET"])
 @csrf_exempt
@@ -252,6 +260,7 @@ def get_scene_list(request):
         'total_count': paginator.count
     })
 
+
 '''
 ⬇⬇⬇⬇表3,子网
 '''
@@ -278,7 +287,7 @@ def add_subnet_list(request):
         subnet_mask = data['subnetMask']
         subnet_name = data['subnetName']
         node_list = data.get('nodeList', [])
-
+        details = data.get('details',[])
         # 验证场景存在
         try:
             scene = Scene.objects.get(id=scene_id)
@@ -296,7 +305,7 @@ def add_subnet_list(request):
             }, status=400)
 
         # 新增：验证子网网段唯一性（相同IP+掩码）
-        if Subnet.objects.filter(sceneId=scene,subnetIp=subnet_ip, subnetMask=subnet_mask).exists():
+        if Subnet.objects.filter(sceneId=scene, subnetIp=subnet_ip, subnetMask=subnet_mask,subnetType=Subnet.SubnetTypeChoices.SUB).exists():
             return JsonResponse({
                 'status': 'error',
                 'message': f'子网网段 {subnet_ip}/{subnet_mask} 已存在'
@@ -332,7 +341,8 @@ def add_subnet_list(request):
                 subnetName=subnet_name,
                 subnetIp=subnet_ip,
                 subnetMask=subnet_mask,
-                subnetType = "sub"
+                details = details,
+                subnetType="sub"
             )
             # 准备IP分配（跳过网络地址和广播地址）
             ip_generator = network.hosts()
@@ -354,7 +364,7 @@ def add_subnet_list(request):
                     # 查找节点的默认接口
                     default_interface = node.interfaces.filter(is_default=True).first()
 
-                    if default_interface:#不该是默认接口了！！
+                    if default_interface:  #不该是默认接口了！！
                         # 更新现有默认接口
                         default_interface.subnet = subnet
                         default_interface.interfaceIp = new_ip
@@ -366,9 +376,9 @@ def add_subnet_list(request):
                         default_interface.save()
                     else:
                         # 创建新接口作为默认接口
-                        # 查找可用接口索引（0-3）
+                        # 查找可用接口索引（0-9）
                         existing_indices = node.interfaces.values_list('interfaceIndex', flat=True)
-                        for index in range(4):
+                        for index in range(10):
                             if index not in existing_indices:
                                 interface_index = index
                                 break
@@ -376,7 +386,7 @@ def add_subnet_list(request):
                             # 找不到可用接口索引
                             return JsonResponse({
                                 'status': 'error',
-                                'message': f'节点 {node_id} 已达到最大接口数 (4个)'
+                                'message': f'节点 {node_id} 已达到最大接口数 (10个)'
                             }, status=400)
 
                         Interface.objects.create(
@@ -387,7 +397,7 @@ def add_subnet_list(request):
                             is_default=False,
                             is_allocated=False,
                             subnet=subnet,
-                            interfaceType = "sub"
+                            interfaceType="sub"
                         )
 
                 except Node.DoesNotExist:
@@ -416,6 +426,69 @@ def add_subnet_list(request):
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+'''
+@require_http_methods(["PUT"])
+@csrf_exempt
+def edit_subnet_list(request, subnet_id):
+    if request.method != 'PUT':
+        return JsonResponse({
+            'status': 'error',
+            'message': '仅支持PUT方法'
+        }, status=405)
+
+    try:
+        # 从请求体获取JSON数据
+        try:
+            data = json.loads(request.body)
+        except json.JSONDecodeError:
+            return JsonResponse({'status': 'error', 'message': '无效的JSON格式'}, status=400)
+
+        # 获取子网对象
+        try:
+            subnet = Subnet.objects.select_related('sceneId').get(id=subnet_id)
+        except Subnet.DoesNotExist:
+            return JsonResponse({
+                'status': 'error',
+                'message': f'子网ID {subnet_id} 不存在'
+            }, status=404)
+
+        scene = subnet.sceneId
+
+        # 获取字段值
+        subnet_name = data.get('subnetName', subnet.subnetName)
+        details = data.get('details', subnet.details)
+
+        # 验证子网名唯一性
+        if 'subnetName' in data and subnet_name != subnet.subnetName:
+            if Subnet.objects.filter(
+                sceneId=scene,
+                subnetName=subnet_name
+            ).exclude(id=subnet_id).exists():
+                return JsonResponse({
+                    'status': 'error',
+                    'message': f'场景 \"{scene.sceneName}\" 中已存在名为 \"{subnet_name}\" 的子网'
+                }, status=400)
+
+        # 更新子网
+        with transaction.atomic():
+            subnet.subnetName = subnet_name
+            subnet.details = details
+            subnet.full_clean()
+            subnet.save()
+
+        return JsonResponse({
+            'status': 'success',
+            'message': '子网更新成功',
+            'subnetId': subnet.id
+        })
+
+    except ValidationError as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+'''
+
 
 @require_http_methods(["PUT"])
 @csrf_exempt
@@ -449,7 +522,7 @@ def edit_subnet_list(request, subnet_id):
         subnet_mask = data.get('subnetMask', subnet.subnetMask)
         subnet_name = data.get('subnetName', subnet.subnetName)
         node_list = data.get('nodeList', None)
-
+        details = data.get('details',subnet.details)
         # 如果提供了新子网名称，才验证唯一性
         if 'subnetName' in data and subnet_name != subnet.subnetName:
             if Subnet.objects.filter(
@@ -503,10 +576,11 @@ def edit_subnet_list(request, subnet_id):
         # 使用事务确保原子操作
         with transaction.atomic():
             # 更新子网基本信息
-            if any(field in data for field in ['subnetName', 'subnetIp', 'subnetMask']):
+            if any(field in data for field in ['subnetName', 'subnetIp', 'subnetMask','details']):
                 subnet.subnetName = subnet_name
-                subnet.subnetIp = subnet_ip
+                # subnet.subnetIp = subnet_ip
                 subnet.subnetMask = subnet_mask
+                subnet.details = details
                 subnet.full_clean()
                 subnet.save()
 
@@ -522,15 +596,13 @@ def edit_subnet_list(request, subnet_id):
                 # 需要添加的节点（在新列表中但当前不在子网中）
                 nodes_to_add = new_nodes - current_nodes
 
-                for node_id in current_nodes:
-                    node = Node.objects.get(id=node_id, sceneId=scene)
-                    interfaces = Interface.objects.filter(
-                        node=node,
-                        subnet=subnet
-                    )
-                    interfaces.delete()
-
-
+                # for node_id in current_nodes:
+                #     node = Node.objects.get(id=node_id, sceneId=scene)
+                #     interfaces = Interface.objects.filter(
+                #         node=node,
+                #         subnet=subnet
+                #     )
+                #     interfaces.delete()
 
                 # === 处理需要移除的节点 ===
                 for node_id in nodes_to_remove:
@@ -577,31 +649,55 @@ def edit_subnet_list(request, subnet_id):
 
                 # ... 前面的代码保持不变 ...
 
-                # === 处理需要添加的节点 ===
-                # 先获取子网所有已分配IP（一次性查询提高效率）
+                # 获取 interfaceList（从 request.POST 或 request.data 中获取）
+                interface_list = data.get('interfaceList', [])
+
+                # 构建 nodeId -> 指定IP 映射
+                interface_ip_map = {entry['nodeId']: entry.get('interfaceIp') for entry in interface_list if
+                                    'nodeId' in entry}
+
+                # 查询已分配 IP
                 allocated_ips = set(
                     Interface.objects.filter(subnet=subnet)
                     .exclude(interfaceIp__isnull=True)
                     .values_list('interfaceIp', flat=True)
                 )
 
-                # 生成子网所有可用IP（按顺序）
+                # 构建可用 IP 列表
                 all_ips = [str(ip) for ip in network.hosts()]
                 available_ips = [ip for ip in all_ips if ip not in allocated_ips]
+                # 再去除前端已指定的 IP（避免自动分配重复）
+                specified_ips = {ip for ip in interface_ip_map.values() if ip}
+                available_ips = [ip for ip in available_ips if ip not in specified_ips]
 
-                if len(available_ips) < len(new_nodes):
+                # # 检查前端传来的 IP 是否冲突
+                # for node_id, ip in interface_ip_map.items():
+                #     if ip and ip in allocated_ips:
+                #         return JsonResponse({
+                #             'status': 'error',
+                #             'message': f'节点 {node_id} 指定的 IP {ip} 已被占用'
+                #         }, status=400)
+                #     if ip and ip not in all_ips:
+                #         return JsonResponse({
+                #             'status': 'error',
+                #             'message': f'节点 {node_id} 指定的 IP {ip} 不在子网 {subnet.subnetIp}/{subnet.subnetMask} 范围内'
+                #         }, status=400)
+
+                # 为未指定 IP 的节点预留足够数量
+                unspecified_nodes = [node_id for node_id in new_nodes if not interface_ip_map.get(node_id)]
+                if len(available_ips) < len(unspecified_nodes):
                     return JsonResponse({
                         'status': 'error',
-                        'message': f'子网中可用IP不足（需要 {len(new_nodes)} 个，可用 {len(available_ips)} 个）'
+                        'message': f'子网中可用IP不足（需要 {len(unspecified_nodes)} 个，可用 {len(available_ips)} 个）'
                     }, status=400)
 
-                # 按顺序分配IP
                 ip_iter = iter(available_ips)
 
-                for node_id in new_nodes:
+                for node_id in nodes_to_add:
                     try:
                         node = Node.objects.get(id=node_id, sceneId=scene)
-                        new_ip = next(ip_iter)
+                        specified_ip = interface_ip_map.get(node_id)
+                        assigned_ip = specified_ip if specified_ip else next(ip_iter)
 
                         # 查找节点的默认接口
                         default_interface = node.interfaces.filter(is_default=True).first()
@@ -609,41 +705,33 @@ def edit_subnet_list(request, subnet_id):
                         if default_interface:
                             # 更新现有默认接口：移动到当前子网
                             default_interface.subnet = subnet
-                            default_interface.interfaceIp = new_ip
+                            default_interface.interfaceIp = assigned_ip
                             default_interface.subnetMask = subnet_mask
                             default_interface.is_allocated = False
-                            default_interface.is_default  = False
+                            default_interface.is_default = False
                             default_interface.save()
                         else:
                             # 没有默认接口，创建新接口作为默认接口
                             existing_indices = node.interfaces.values_list('interfaceIndex', flat=True)
-                            interface_index = None
-                            for index in range(4):
-                                if index not in existing_indices:
-                                    interface_index = index
-                                    break
+                            interface_index = next((i for i in range(10) if i not in existing_indices), None)
 
                             if interface_index is None:
                                 return JsonResponse({
                                     'status': 'error',
-                                    'message': f'节点 {node_id} 已达到最大接口数 (4个)'
+                                    'message': f'节点 {node_id} 已达到最大接口数 (10个)'
                                 }, status=400)
 
-                            # 创建新接口并设为默认
                             Interface.objects.create(
                                 node=node,
-                                interfaceIp=new_ip,
+                                interfaceIp=assigned_ip,
                                 interfaceIndex=interface_index,
                                 subnetMask=subnet_mask,
                                 is_default=False,
                                 is_allocated=False,
                                 subnet=subnet
                             )
-
                     except Node.DoesNotExist:
                         continue
-
-                # ... 后面的代码保持不变 ...
 
                 # === 批量处理默认子网的IP分配 ===  感觉用不到这些
                 # 为移动到默认子网的节点分配IP（批量操作提高效率）
@@ -717,7 +805,7 @@ def get_subnet_list(request):
         scene_id = request.GET.get('sceneId')
         subnet_name = request.GET.get('subnetName')
         subnet_ip = request.GET.get('subnetIp')
-
+        reorder_interfaces_by_scene(scene_id)  # 给接口排序，sub类的接口在前
         # 预取接口数据
         interface_prefetch = Prefetch(
             'interfaces',
@@ -728,9 +816,9 @@ def get_subnet_list(request):
         )
 
         # 构建基础查询集（只查询类型为 sub 的子网）
-        queryset = Subnet.objects.filter(subnetType=Subnet.SubnetTypeChoices.SUB)\
-                                 .prefetch_related(interface_prefetch)\
-                                 .select_related('sceneId')
+        queryset = Subnet.objects.filter(subnetType=Subnet.SubnetTypeChoices.SUB) \
+            .prefetch_related(interface_prefetch) \
+            .select_related('sceneId')
 
         # 过滤条件
         if subnet_id:
@@ -772,7 +860,8 @@ def get_subnet_list(request):
                 'subnetMask': subnet.subnetMask,
                 'subnetType': subnet.subnetType,
                 'interfaceCount': subnet.interfaces.count(),
-                'interfaces': []
+                'details': subnet.details,
+                'interfaces': [],
             }
 
             for interface in subnet.interfaces.all():
@@ -800,7 +889,6 @@ def get_subnet_list(request):
 
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': f'服务器内部错误: {str(e)}'}, status=500)
-
 
 
 @csrf_exempt
@@ -877,6 +965,7 @@ def delete_subnet_list(request, subnet_id=None):
             'message': f'删除子网失败: {str(e)}'
         }, status=500)
 
+
 '''
 节点表
 '''
@@ -939,10 +1028,12 @@ def create_default_interface(node):
             is_default=True,
             is_allocated=False,
             subnet=locked_subnet,
-            interfaceType = "sub"
+            interfaceType="sub"
         )
 
     return interface
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def add_node_list(request):
@@ -980,7 +1071,8 @@ def add_node_list(request):
                 nodeName=data['nodeName'],
                 nodeImage=data.get('nodeImage'),
                 nodeType=data['nodeType'],
-                details=data.get('details')
+                details=data.get('details'),
+                specialType = data.get('specialType')
             )
 
             if node.nodeType == 'satellite':
@@ -1030,6 +1122,50 @@ def add_node_list(request):
         return JsonResponse({'status': 'error', 'message': f'服务器错误: {str(e)}'}, status=500)
 
 
+
+def reorder_interfaces_by_scene(scene_id):
+    """
+    根据场景 ID，重新分配该场景下所有节点的接口序号。
+    sub 接口在前，link 接口在后；sub 内部按子网创建顺序排序。
+    完全避免 UNIQUE constraint 冲突。
+    """
+    try:
+        scene = Scene.objects.get(id=scene_id)
+    except Scene.DoesNotExist:
+        print(f"场景 {scene_id} 不存在")
+        return
+
+    nodes = scene.nodes.all()
+    for node in nodes:
+        interfaces = list(node.interfaces.all())
+        if not interfaces:
+            continue
+
+        # 分组排序
+        sub_ifaces = sorted(
+            [i for i in interfaces if i.interfaceType == Interface.InterfaceTypeChoices.SUB],
+            key=lambda x: (x.subnet.id if x.subnet else 0, x.id)
+        )
+        link_ifaces = sorted(
+            [i for i in interfaces if i.interfaceType == Interface.InterfaceTypeChoices.LINK],
+            key=lambda x: x.id
+        )
+
+        # 使用事务，保证原子操作
+        with transaction.atomic():
+            # 第一步：给每个接口分配一个唯一的临时 index（避免冲突）
+            temp_base = 10000
+            for i, iface in enumerate(sub_ifaces + link_ifaces):
+                Interface.objects.filter(id=iface.id).update(interfaceIndex=temp_base + i)
+
+            # 第二步：按顺序分配最终 index
+            for final_index, iface in enumerate(sub_ifaces + link_ifaces):
+                Interface.objects.filter(id=iface.id).update(interfaceIndex=final_index)
+
+        # print(f"{node.nodeName} 正式分配完序号")
+
+    print(f"场景 {scene.sceneName} 下所有节点接口序号重排完成")
+
 @require_http_methods(["GET"])
 @csrf_exempt
 def get_node_list(request):
@@ -1038,9 +1174,15 @@ def get_node_list(request):
         scene_id = request.GET.get('sceneId', '')
         node_type = request.GET.get('nodeType', '')
         node_name = request.GET.get('nodeName', '')
-        page_size = int(request.GET.get('size', 10))
-        page_number = int(request.GET.get('page', 1))
+        try:
+            page_size = int(request.GET.get('size', 10) or 10)
+        except ValueError:
+            page_size = 10
 
+        try:
+            page_number = int(request.GET.get('page', 1) or 1)
+        except ValueError:
+            page_number = 1
         # 构建查询条件
         query = Q()
         if scene_id:
@@ -1051,7 +1193,7 @@ def get_node_list(request):
             query &= Q(nodeName__icontains=node_name)
 
         # 获取查询结果并分页
-        nodes = Node.objects.filter(query).order_by('nodeName')
+        nodes = Node.objects.filter(query).order_by('id')
         paginator = Paginator(nodes, page_size)
         try:
             page_obj = paginator.page(page_number)
@@ -1059,7 +1201,8 @@ def get_node_list(request):
             return JsonResponse({'status': 'error', 'message': '页码必须是整数'}, status=400)
         except EmptyPage:
             return JsonResponse({'status': 'error', 'message': '页码超出范围'}, status=400)
-
+        if scene_id:
+            reorder_interfaces_by_scene(scene_id)#给接口排序，sub类的接口在前
         # 准备返回数据结构
         node_list = []
         for node in page_obj:
@@ -1074,6 +1217,29 @@ def get_node_list(request):
                     if isinstance(detail_obj, str):
                         # 如果已经是字符串，先转成 dict
                         detail_obj = json.loads(detail_obj)
+                    # 添加 isHideEnable 字段
+                    detail_obj["isHideEnable"] = (interface.interfaceType == Interface.InterfaceTypeChoices.LINK)
+                    detail_obj.setdefault("Network", {})
+                    detail_obj['Network']['IPv4Address'] = interface.interfaceIp
+                    detail_obj['Network']['IPv4SubnetMask'] = interface.subnetMask
+                    # 获取所属链路信息
+                    links = interface.links
+                    if links:
+                        link = links[0]
+                        # 原始类型（可能是中文）
+                        db_type = getattr(link, "linkType", None)
+                        # 中英文映射
+                        type_map = {
+                            "有线": "wired",
+                            "无线": "wireless"
+                        }
+                        detail_obj["linkType"] = type_map.get(db_type, db_type)  # 如果不是有线/无线，保持原值
+                        # linkConfig 原样写入
+                        detail_obj["linkConfig"] = getattr(link, "linkConfig", None)
+                    else:
+                        detail_obj["linkConfig"] = None
+                        detail_obj["linkType"] = None
+
                     json_str = json.dumps(detail_obj)  # 会自动加 \ 转义
                     details_list.append(json_str)
                 except Exception as e:
@@ -1097,6 +1263,8 @@ def get_node_list(request):
                 'raan': node.raan,
                 'startTime': node.startTime.isoformat() if node.startTime else None,
                 'viaPoints': node.viaPoints if node.viaPoints else [],
+                'specialType':node.specialType,
+                # 'details':node.details
                 'details': details_list  # ⬅️ 接口 detail 的 JSON 字符串数组
             }
             node_list.append(node_data)
@@ -1126,6 +1294,7 @@ def get_node_list(request):
         logger.error(f"Error in get_node_list: {str(e)}\n{traceback.format_exc()}")
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
+
 @csrf_exempt
 @require_http_methods(["PUT"])
 def edit_node_list(request, node_id):
@@ -1141,7 +1310,7 @@ def edit_node_list(request, node_id):
         node.nodeName = data.get('nodeName', node.nodeName)
         node.nodeImage = data.get('nodeImage', node.nodeImage)
         node.nodeType = data.get('nodeType', node.nodeType)
-
+        node.specialType = data.get('specialType',node.specialType)
         # 验证场景是否存在（如果提供了 sceneId）
         scene_id = data.get('sceneId')
         if scene_id is not None:  # 允许 sceneId 为空字符串或显式设置为 None 的情况
@@ -1206,13 +1375,6 @@ def edit_node_list(request, node_id):
 
             # 更新每个接口的 detail 字段
             for i, interface in enumerate(interfaces):
-                # try:
-                #     json.loads(details[i])  # 检查是否为合法 JSON 字符串
-                # except json.JSONDecodeError:
-                #     return JsonResponse({
-                #         'status': 'error',
-                #         'message': f'Invalid JSON at details index {i}'
-                #     }, status=400)
                 interface.detail = details[i]
                 interface.save(update_fields=['detail'])
         node.save()
@@ -1222,6 +1384,7 @@ def edit_node_list(request, node_id):
         return JsonResponse({'status': 'error', 'message': 'Invalid JSON format'}, status=400)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
 
 @require_http_methods(["DELETE"])
 @csrf_exempt
@@ -1238,14 +1401,25 @@ def delete_node_list(request, node_id):
 业务表
 add: 节点必须已经有。
 '''
+
+
 @api_view(['POST'])
-@csrf_exempt
+@csrf_exempt  # 可选：如果你前端不使用 CSRF token，可保留；使用了就可以删掉
 def add_configuration_list(request):
+    """
+    新建业务配置（支持 CBR/FTP/TRAFFIC-GEN/HTTP 类型）
+    """
     serializer = ConfigurationSerializer(data=request.data)
     if serializer.is_valid():
-        serializer.save()
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        config = serializer.save()
+        return Response({
+            "message": "创建成功",
+            "data": ConfigurationSerializer(config).data
+        }, status=status.HTTP_201_CREATED)
+    return Response({
+        "message": "参数错误",
+        "errors": serializer.errors
+    }, status=status.HTTP_400_BAD_REQUEST)
 
 
 @require_http_methods(["GET"])
@@ -1256,6 +1430,7 @@ def get_configuration_list(request):
     source_node_name = request.GET.get('sourceNodeName', '')
     destination_node_name = request.GET.get('destinationNodeName', '')
     business_type = request.GET.get('businessType', '')
+    scene_id = request.GET.get('sceneId', '')
 
     # 构建查询条件
     query = Q()
@@ -1267,6 +1442,8 @@ def get_configuration_list(request):
         query &= Q(destinationNodeId__nodeName__icontains=destination_node_name)
     if business_type:
         query &= Q(businessType__icontains=business_type)
+    if scene_id:
+        query &= Q(sceneId=scene_id)
 
     # 获取查询结果并分页
     configurations = Configuration.objects.filter(query).order_by('businessName')
@@ -1278,16 +1455,26 @@ def get_configuration_list(request):
         'sceneId': config.sceneId.id,
         'id': config.id,
         'businessName': config.businessName,
-        'sourceNodeId': config.sourceNodeId.id,
-        'sourceNodeName': config.sourceNodeId.nodeName,
-        'destinationNodeId': config.destinationNodeId.id,
-        'destinationNodeName': config.destinationNodeId.nodeName,
+        'sourceNodeId': config.sourceNodeId.id if config.sourceNodeId else None,
+        'sourceNodeName': config.sourceNodeId.nodeName if config.sourceNodeId else '',
+        'destinationNodeId': config.destinationNodeId.id if config.destinationNodeId else None,
+        'destinationNodeName': config.destinationNodeId.nodeName if config.destinationNodeId else '',
         'cbrStartTime': config.cbrStartTime,
         'cbrEndTime': config.cbrEndTime,
         'cbrSendInterval': config.cbrSendInterval,
         'cbrPacketSize': config.cbrPacketSize,
+        'TransferType': config.TransferType,
         'ftpStartTime': config.ftpStartTime,
         'ftpPacketCount': config.ftpPacketCount,
+        'tgStartTime': config.tgStartTime,
+        'tgDurationTime': config.tgDurationTime,
+        'tgPacketSize': config.tgPacketSize,
+        'tgSendInterval': config.tgSendInterval,
+        'clientId': config.clientId.id if config.clientId else None,
+        'clientName': config.clientId.nodeName if config.clientId else '',
+        'serverList': config.serverList,
+        'httpStartTime': config.httpStartTime,
+        'httpThreshTime': config.httpThreshTime,
         'businessType': config.businessType
     } for config in page_obj]
 
@@ -1300,6 +1487,7 @@ def get_configuration_list(request):
         'total_count': paginator.count,  # 当前查询结果的总记录数
     })
 
+
 @require_http_methods(["PUT", "PATCH"])
 @csrf_exempt
 def edit_configuration_list(request, configuration_id):
@@ -1308,36 +1496,54 @@ def edit_configuration_list(request, configuration_id):
     except Configuration.DoesNotExist:
         return JsonResponse({'status': 'error', 'message': '业务不存在'}, status=404)
 
-    # 从请求中获取数据
     data = json.loads(request.body)
-    businessName = data.get('businessName', config.businessName)
-    sourceNodeId = data.get('sourceNodeId', config.sourceNodeId_id)  # 注意这里是 sourceNodeId_id
-    destinationNodeId = data.get('destinationNodeId', config.destinationNodeId_id)  # 注意这里是 destinationNodeId_id
 
-    # 更新业务名称
-    config.businessName = businessName
+    # 更新通用字段
+    config.businessName = data.get('businessName', config.businessName)
 
-    # 更新节点 ID
-    if sourceNodeId:
-        config.sourceNodeId = Node.objects.get(id=sourceNodeId)
-    if destinationNodeId:
-        config.destinationNodeId = Node.objects.get(id=destinationNodeId)
-    # 更新业务类型特定的字段
-    business_type = data.get('businessType', config.businessType)
-    config.businessType = business_type
+    source_node_id = data.get('sourceNodeId')
+    if source_node_id:
+        config.sourceNodeId = Node.objects.get(id=source_node_id)
 
-    if business_type == 'cbr':
+    destination_node_id = data.get('destinationNodeId')
+    if destination_node_id:
+        config.destinationNodeId = Node.objects.get(id=destination_node_id)
+
+    # 不允许修改 businessType，只使用原有值判断更新内容
+    business_type = config.businessType.upper()
+
+    if business_type == 'CBR':
         config.cbrStartTime = data.get('cbrStartTime', config.cbrStartTime)
         config.cbrEndTime = data.get('cbrEndTime', config.cbrEndTime)
         config.cbrSendInterval = data.get('cbrSendInterval', config.cbrSendInterval)
         config.cbrPacketSize = data.get('cbrPacketSize', config.cbrPacketSize)
-    elif business_type == 'ftp':
+        config.TransferType = data.get('TransferType', config.TransferType)
+    elif business_type == 'FTP':
         config.ftpStartTime = data.get('ftpStartTime', config.ftpStartTime)
         config.ftpPacketCount = data.get('ftpPacketCount', config.ftpPacketCount)
-    # 保存更新的配置
+
+    elif business_type == 'TRAFFIC-GEN':
+        config.tgStartTime = data.get('tgStartTime', config.tgStartTime)
+        config.tgDurationTime = data.get('tgDurationTime', config.tgDurationTime)
+        config.tgPacketSize = data.get('tgPacketSize', config.tgPacketSize)
+        config.tgSendInterval = data.get('tgSendInterval', config.tgSendInterval)
+
+    elif business_type == 'HTTP':
+        client_id = data.get('clientId')
+        if client_id:
+            config.clientId = Node.objects.get(id=client_id)
+
+        server_list = data.get('serverList')
+        if server_list is not None:
+            config.serverList = server_list
+
+        config.httpStartTime = data.get('httpStartTime', config.httpStartTime)
+        config.httpThreshTime = data.get('httpThreshTime', config.httpThreshTime)
+
     config.save()
 
     return JsonResponse({'status': 'success'})
+
 
 @require_http_methods(["DELETE"])
 @csrf_exempt
@@ -1354,7 +1560,6 @@ def delete_configuration_list(request, configuration_id):
     except Exception as e:
         # 其他错误，返回500错误
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
 
 
 # subnet_manager = SubnetManager()
@@ -1395,6 +1600,7 @@ def allocate_link_ips(scene_id, subnet_ip, subnetMask, source_node, dest_node):
 
     return available_ips[0], available_ips[1]
 
+
 def get_or_create_interface(node, ip, mask, subnet):
     # 优先尝试复用默认接口
     interface = Interface.objects.filter(
@@ -1427,6 +1633,7 @@ def get_or_create_interface(node, ip, mask, subnet):
 
     return interface
 
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def add_link_list(request):
@@ -1436,12 +1643,16 @@ def add_link_list(request):
         source_node_name = data.get('sourceNodeName')
         dest_node_name = data.get('destinationNodeName')
         link_type = data.get('linkType')
-        bandwidth = data.get('bandwidth')
+        bandwidth = data.get('bandwidth',0)
+        bandwidth = float(bandwidth) if bandwidth not in [None, ""] else 0.0
+        bandwidth = bandwidth * 10 ** 6
         packet_header_size = data.get('packetHeaderSize')
         link_name = data.get('linkName') or f"{source_node_name}到{dest_node_name}({link_type})"
         subnet_ip = data.get('subnetIp')
         subnet_mask = data.get('subnetMask')
-
+        link_config = data.get("linkConfig")
+        if link_config is None:
+            link_config = True
         # 新增：根据链路类型获取特有属性
         transmission_delay = None
         packet_loss_rate = None
@@ -1543,7 +1754,8 @@ def add_link_list(request):
                 subnet=subnet,
                 transmissionDelay=transmission_delay if link_type == '有线' else None,
                 packetLossRate=packet_loss_rate if link_type == '有线' else None,
-                transmissionSpeed=transmission_speed if link_type == '无线' else None
+                transmissionSpeed=transmission_speed if link_type == '无线' else None,
+                linkConfig = link_config
             )
 
         return JsonResponse({'status': 'success'})
@@ -1571,8 +1783,8 @@ def get_link_list(request):
         link_type = request.GET.get('linkType', '')
         scene_id = request.GET.get('sceneId', '')
         page = int(request.GET.get('page', 1))
-        page_size = int(request.GET.get('pageSize', 10))
-
+        page_size = int(request.GET.get('size', 40))
+        reorder_interfaces_by_scene(scene_id)  # 给接口排序，sub类的接口在前
         # 构建查询条件
         query = Q()
         if link_name:
@@ -1618,12 +1830,12 @@ def get_link_list(request):
                 'sceneName': link.sceneId.sceneName,
                 'subnetIp': link.subnetIp,
                 'subnetMask': link.subnetMask,
-                'bandwidth': link.bandwidth,
+                'bandwidth': link.bandwidth / 10 ** 6,
                 'packetHeaderSize': link.packetHeaderSize,
                 'transmissionDelay': link.transmissionDelay,
                 'packetLossRate': link.packetLossRate,
                 'transmissionSpeed': link.transmissionSpeed,
-
+                'linkConfig':link.linkConfig,
                 # 新增接口信息
                 'sourceInterfaceIp': link.sourceInterface.interfaceIp if link.sourceInterface else None,
                 'sourceInterfaceIndex': link.sourceInterface.interfaceIndex if link.sourceInterface else None,
@@ -1672,15 +1884,17 @@ def edit_link_list(request, link_id):
             scene_id = data.get('sceneId', link.sceneId.id)
             subnet_ip = data.get('subnetIp', link.subnetIp)
             subnet_mask = data.get('subnetMask', link.subnetMask)
+
             source_interface_ip = data.get('sourceInterfaceIp')
             dest_interface_ip = data.get('destinationInterfaceIp')
             source_node_name = data.get('sourceNodeName', link.sourceNodeId.nodeName)
             dest_node_name = data.get('destinationNodeName', link.destinationNodeId.nodeName)
             link_type = data.get('linkType', link.linkType)
             link_name = data.get('linkName', f"{source_node_name}到{dest_node_name}({link_type})")
-
+            link_Config = data.get('linkConfig',link.linkConfig)
             # 新增：根据链路类型获取特有属性
-            bandwidth = data.get('bandwidth', link.bandwidth)
+            bandwidth = data.get('bandwidth')
+            bandwidth = bandwidth * 10 ** 6
             packet_header_size = data.get('packetHeaderSize', link.packetHeaderSize)
 
             # 处理有线特有属性
@@ -1756,32 +1970,32 @@ def edit_link_list(request, link_id):
             if conflict_response := check_link_conflict():
                 return conflict_response
 
+            #注释掉子网及接口修改，不允许修改。
             # 处理子网变更
-            subnet = link.subnet
-            subnet_changed = False
-
-            # 如果前端传了子网信息
-            if subnet_ip and subnet_mask:
-                # 检查子网是否已存在
-                subnet, created = Subnet.objects.get_or_create(
-                    sceneId=scene,
-                    subnetIp=subnet_ip,
-                    subnetMask=subnet_mask,
-                    defaults={'subnetName': f"子网 {subnet_ip}/{subnet_mask}"},
-                    subnetType = "link"
-                )
-
-                # 如果子网是新创建的或不同于原来的子网
-                if created or subnet != link.subnet:
-                    subnet_changed = True
-            else:
-                # 如果没有传递子网信息，使用原来的子网
-                subnet = link.subnet
-                subnet_ip = subnet.subnetIp
-                subnet_mask = subnet.subnetMask
-
-            # 记录节点是否变更
-            nodes_changed = link.sourceNodeId != source_node or link.destinationNodeId != dest_node
+            # subnet = link.subnet
+            # subnet_changed = False
+            #
+            # # 如果前端传了子网信息
+            # if subnet_ip and subnet_mask:
+            #     # 检查子网是否已存在
+            #     subnet, created = Subnet.objects.get_or_create(
+            #         sceneId=scene,
+            #         subnetIp=subnet_ip,
+            #         subnetMask=subnet_mask,
+            #         defaults={'subnetName': f"子网 {subnet_ip}/{subnet_mask}"},
+            #         subnetType="link"
+            #     )
+            #     # 如果子网是新创建的或不同于原来的子网
+            #     if created or subnet != link.subnet:
+            #         subnet_changed = True
+            # else:
+            #     # 如果没有传递子网信息，使用原来的子网
+            #     subnet = link.subnet
+            #     subnet_ip = subnet.subnetIp
+            #     subnet_mask = subnet.subnetMask
+            #
+            # # 记录节点是否变更
+            # nodes_changed = link.sourceNodeId != source_node or link.destinationNodeId != dest_node
 
             # 更新核心字段
             link.sceneId = scene
@@ -1792,138 +2006,139 @@ def edit_link_list(request, link_id):
             link.transmissionDelay = transmission_delay
             link.packetLossRate = packet_loss_rate
             link.transmissionSpeed = transmission_speed
-            link.subnetIp = subnet_ip
-            link.subnetMask = subnet_mask
-            link.sourceNodeId = source_node
-            link.destinationNodeId = dest_node
-            link.subnet = subnet
+            # link.subnetIp = subnet_ip
+            # link.subnetMask = subnet_mask
+            # link.sourceNodeId = source_node
+            # link.destinationNodeId = dest_node
+            # link.subnet = subnet
+            link.linkConfig = link_Config #判断是否需要从接口单独配置参数。
 
-            # 处理接口变更
-            interface_update_needed = subnet_changed or nodes_changed
-
-            # 如果前端传了接口IP
-            if source_interface_ip or dest_interface_ip:
-                # 验证源接口IP
-                if source_interface_ip:
-                    # 检查IP是否已被占用（排除当前接口）
-                    if Interface.objects.filter(
-                            interfaceIp=source_interface_ip,
-                            subnetMask=subnet_mask,
-
-                    ).exclude(id=link.sourceInterface.id).exists():
-                        return JsonResponse(
-                            {'status': 'error', 'message': f'源IP地址 {source_interface_ip} 已被占用'},
-                            status=400
-                        )
-
-                    # 验证IP是否在子网内
-                    try:
-                        network = ipaddress.IPv4Network(f"{subnet_ip}/{subnet_mask}", strict=False)
-                        ip_address = ipaddress.IPv4Address(source_interface_ip)
-                        if ip_address not in network:
-                            return JsonResponse(
-                                {'status': 'error',
-                                 'message': f'源IP地址 {source_interface_ip} 不在子网 {subnet_ip}/{subnet_mask} 内'},
-                                status=400
-                            )
-                    except ValueError:
-                        return JsonResponse(
-                            {'status': 'error', 'message': '无效的子网配置'},
-                            status=400
-                        )
-
-                    link.sourceInterface.interfaceIp = source_interface_ip
-                    interface_update_needed = True
-
-                # 验证目的接口IP
-                if dest_interface_ip:
-                    # 检查IP是否已被占用（排除当前接口）
-                    if Interface.objects.filter(
-                            interfaceIp=dest_interface_ip,
-                            subnetMask=subnet_mask
-                    ).exclude(id=link.destinationInterface.id).exists():
-                        return JsonResponse(
-                            {'status': 'error', 'message': f'目的IP地址 {dest_interface_ip} 已被占用'},
-                            status=400
-                        )
-
-                    # 验证IP是否在子网内
-                    try:
-                        network = ipaddress.IPv4Network(f"{subnet_ip}/{subnet_mask}", strict=False)
-                        ip_address = ipaddress.IPv4Address(dest_interface_ip)
-                        if ip_address not in network:
-                            return JsonResponse(
-                                {'status': 'error',
-                                 'message': f'目的IP地址 {dest_interface_ip} 不在子网 {subnet_ip}/{subnet_mask} 内'},
-                                status=400
-                            )
-                    except ValueError:
-                        return JsonResponse(
-                            {'status': 'error', 'message': '无效的子网配置'},
-                            status=400
-                        )
-
-                    link.destinationInterface.interfaceIp = dest_interface_ip
-                    interface_update_needed = True
-
-            # 如果没有传接口IP且需要更新接口
-            elif interface_update_needed:
-                # 获取子网中已分配的IP地址
-                allocated_ips = set(
-                    Interface.objects.filter(subnet=subnet)
-                    .exclude(interfaceIp__isnull=True)
-                    .values_list('interfaceIp', flat=True)
-                )
-
-                # 排除当前链路的接口IP
-                if link.sourceInterface.interfaceIp:
-                    allocated_ips.discard(link.sourceInterface.interfaceIp)
-                if link.destinationInterface.interfaceIp:
-                    allocated_ips.discard(link.destinationInterface.interfaceIp)
-
-                # 创建网络对象
-                try:
-                    network = ipaddress.IPv4Network(f"{subnet_ip}/{subnet_mask}", strict=False)
-                except ValueError as e:
-                    return JsonResponse(
-                        {'status': 'error', 'message': f'无效的子网参数: {str(e)}'},
-                        status=400
-                    )
-
-                # 找出两个可用的最小IP
-                available_ips = []
-                for ip in network.hosts():
-                    ip_str = str(ip)
-                    if ip_str not in allocated_ips:
-                        available_ips.append(ip_str)
-                        if len(available_ips) == 2:
-                            break
-
-                if len(available_ips) < 2:
-                    return JsonResponse(
-                        {'status': 'error', 'message': f'子网 {subnet_ip}/{subnet_mask} 中没有足够的可用IP地址'},
-                        status=400
-                    )
-
-                source_ip = available_ips[0]
-                dest_ip = available_ips[1]
-
-                link.sourceInterface.interfaceIp = source_ip
-                link.destinationInterface.interfaceIp = dest_ip
-
-            # 更新接口的其他属性
-            if interface_update_needed:
-                link.sourceInterface.node = source_node
-                link.sourceInterface.subnet = subnet
-                link.sourceInterface.subnetMask = subnet_mask
-                link.sourceInterface.interfaceType = "link"
-                link.sourceInterface.save()
-
-                link.destinationInterface.node = dest_node
-                link.destinationInterface.subnet = subnet
-                link.destinationInterface.subnetMask = subnet_mask
-                link.destinationInterface.interfaceType = "link"
-                link.destinationInterface.save()
+            # # 处理接口变更
+            # interface_update_needed = subnet_changed or nodes_changed
+            #
+            # # 如果前端传了接口IP
+            # if source_interface_ip or dest_interface_ip:
+            #     # 验证源接口IP
+            #     if source_interface_ip:
+            #         # 检查IP是否已被占用（排除当前接口）
+            #         if Interface.objects.filter(
+            #                 interfaceIp=source_interface_ip,
+            #                 subnetMask=subnet_mask,
+            #
+            #         ).exclude(id=link.sourceInterface.id).exists():
+            #             return JsonResponse(
+            #                 {'status': 'error', 'message': f'源IP地址 {source_interface_ip} 已被占用'},
+            #                 status=400
+            #             )
+            #
+            #         # 验证IP是否在子网内
+            #         try:
+            #             network = ipaddress.IPv4Network(f"{subnet_ip}/{subnet_mask}", strict=False)
+            #             ip_address = ipaddress.IPv4Address(source_interface_ip)
+            #             if ip_address not in network:
+            #                 return JsonResponse(
+            #                     {'status': 'error',
+            #                      'message': f'源IP地址 {source_interface_ip} 不在子网 {subnet_ip}/{subnet_mask} 内'},
+            #                     status=400
+            #                 )
+            #         except ValueError:
+            #             return JsonResponse(
+            #                 {'status': 'error', 'message': '无效的子网配置'},
+            #                 status=400
+            #             )
+            #
+            #         link.sourceInterface.interfaceIp = source_interface_ip
+            #         interface_update_needed = True
+            #
+            #     # 验证目的接口IP
+            #     if dest_interface_ip:
+            #         # 检查IP是否已被占用（排除当前接口）
+            #         if Interface.objects.filter(
+            #                 interfaceIp=dest_interface_ip,
+            #                 subnetMask=subnet_mask
+            #         ).exclude(id=link.destinationInterface.id).exists():
+            #             return JsonResponse(
+            #                 {'status': 'error', 'message': f'目的IP地址 {dest_interface_ip} 已被占用'},
+            #                 status=400
+            #             )
+            #
+            #         # 验证IP是否在子网内
+            #         try:
+            #             network = ipaddress.IPv4Network(f"{subnet_ip}/{subnet_mask}", strict=False)
+            #             ip_address = ipaddress.IPv4Address(dest_interface_ip)
+            #             if ip_address not in network:
+            #                 return JsonResponse(
+            #                     {'status': 'error',
+            #                      'message': f'目的IP地址 {dest_interface_ip} 不在子网 {subnet_ip}/{subnet_mask} 内'},
+            #                     status=400
+            #                 )
+            #         except ValueError:
+            #             return JsonResponse(
+            #                 {'status': 'error', 'message': '无效的子网配置'},
+            #                 status=400
+            #             )
+            #
+            #         link.destinationInterface.interfaceIp = dest_interface_ip
+            #         interface_update_needed = True
+            #
+            # # 如果没有传接口IP且需要更新接口
+            # elif interface_update_needed:
+            #     # 获取子网中已分配的IP地址
+            #     allocated_ips = set(
+            #         Interface.objects.filter(subnet=subnet)
+            #         .exclude(interfaceIp__isnull=True)
+            #         .values_list('interfaceIp', flat=True)
+            #     )
+            #
+            #     # 排除当前链路的接口IP
+            #     if link.sourceInterface.interfaceIp:
+            #         allocated_ips.discard(link.sourceInterface.interfaceIp)
+            #     if link.destinationInterface.interfaceIp:
+            #         allocated_ips.discard(link.destinationInterface.interfaceIp)
+            #
+            #     # 创建网络对象
+            #     try:
+            #         network = ipaddress.IPv4Network(f"{subnet_ip}/{subnet_mask}", strict=False)
+            #     except ValueError as e:
+            #         return JsonResponse(
+            #             {'status': 'error', 'message': f'无效的子网参数: {str(e)}'},
+            #             status=400
+            #         )
+            #
+            #     # 找出两个可用的最小IP
+            #     available_ips = []
+            #     for ip in network.hosts():
+            #         ip_str = str(ip)
+            #         if ip_str not in allocated_ips:
+            #             available_ips.append(ip_str)
+            #             if len(available_ips) == 2:
+            #                 break
+            #
+            #     if len(available_ips) < 2:
+            #         return JsonResponse(
+            #             {'status': 'error', 'message': f'子网 {subnet_ip}/{subnet_mask} 中没有足够的可用IP地址'},
+            #             status=400
+            #         )
+            #
+            #     source_ip = available_ips[0]
+            #     dest_ip = available_ips[1]
+            #
+            #     link.sourceInterface.interfaceIp = source_ip
+            #     link.destinationInterface.interfaceIp = dest_ip
+            #
+            # # 更新接口的其他属性
+            # if interface_update_needed:
+            #     link.sourceInterface.node = source_node
+            #     link.sourceInterface.subnet = subnet
+            #     link.sourceInterface.subnetMask = subnet_mask
+            #     link.sourceInterface.interfaceType = "link"
+            #     link.sourceInterface.save()
+            #
+            #     link.destinationInterface.node = dest_node
+            #     link.destinationInterface.subnet = subnet
+            #     link.destinationInterface.subnetMask = subnet_mask
+            #     link.destinationInterface.interfaceType = "link"
+            #     link.destinationInterface.save()
 
             # 保存最终修改
             link.save()
@@ -1945,12 +2160,48 @@ def edit_link_list(request, link_id):
         )
 
 
+'''
+def edit_link_list(request, link_id):
+    """
+    仅修改链路带宽，其余字段保持不变。
+    前端传的数据格式：{"bandwidth": 10}  # 单位：Mbps
+    """
+    try:
+        # 解析请求 JSON
+        data = json.loads(request.body)
+        new_bandwidth = data.get("bandwidth")
+        if new_bandwidth is None:
+            return JsonResponse({'status': 'error', 'message': '缺少带宽参数'}, status=400)
+
+        # 转换为 bps
+        new_bandwidth_bps = float(new_bandwidth) * 1_000_000
+
+        with transaction.atomic():
+            # 获取链路
+            link = Link.objects.select_for_update().get(id=link_id)
+            link.bandwidth = new_bandwidth_bps
+            link.save()
+
+        return JsonResponse({'status': 'success', 'message': f'带宽已更新为 {new_bandwidth_bps} bps'})
+
+    except Link.DoesNotExist:
+        return JsonResponse({'status': 'error', 'message': '链路不存在'}, status=404)
+    except json.JSONDecodeError:
+        return JsonResponse({'status': 'error', 'message': '无效的JSON格式'}, status=400)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JsonResponse({'status': 'error', 'message': f'服务器错误: {str(e)}'}, status=500)
+'''
+
+
 def rearrange_interfaceIndexes(node):
     interfaces = Interface.objects.filter(node=node).order_by('interfaceIndex')
     for index, interface in enumerate(interfaces):
         if interface.interfaceIndex != index:
             interface.interfaceIndex = index
             interface.save()
+
 
 @csrf_exempt
 @require_http_methods(["DELETE"])
@@ -2007,6 +2258,7 @@ def rearrange_interfaceIndexes(node):
 节点故障表
 '''
 
+
 @require_http_methods(["POST"])
 def add_node_error_list(request):
     # 解析 JSON 数据
@@ -2057,6 +2309,8 @@ def add_node_error_list(request):
         return JsonResponse({'status': 'success'})
     else:
         return JsonResponse({'status': 'error', 'errors': form.errors}, status=400)
+
+
 #
 @require_http_methods(["DELETE"])
 def delete_node_error_list(request, node_error_id):
@@ -2072,6 +2326,8 @@ def delete_node_error_list(request, node_error_id):
     except Exception as e:
         # 其他错误，返回500错误
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
+
 #
 @require_http_methods(["GET"])
 def get_node_error_list(request):
@@ -2118,6 +2374,7 @@ def get_node_error_list(request):
         'total_pages': page_obj.paginator.num_pages,
         'total_count': paginator.count,  # 当前查询结果的总记录数
     })
+
 
 '''
 链路故障表
@@ -2264,6 +2521,7 @@ def get_link_error_list(request):
             'message': f'服务器错误: {str(e)}'
         }, status=500)
 
+
 @require_http_methods(["DELETE"])
 def delete_link_error_list(request, link_error_id):
     try:
@@ -2282,7 +2540,7 @@ def delete_link_error_list(request, link_error_id):
 
 @csrf_exempt
 @require_http_methods(["PUT"])
-def edit_link_error_list(request,link_error_id):
+def edit_link_error_list(request, link_error_id):
     # 解析 JSON 数据
     data = json.loads(request.body)
     # 获取表单字段
@@ -2368,6 +2626,7 @@ def edit_node_error_list(request, node_error_id):
 
     return JsonResponse({'status': 'success'})
 
+
 '''
 节点模板表
 '''
@@ -2398,6 +2657,7 @@ def add_node_template_list(request):
         return JsonResponse({"status": "success", "message": "模板添加成功"})
     except Exception as e:
         return JsonResponse({"status": "error", "message": str(e)}, status=400)
+
 
 @require_http_methods(["GET"])
 def get_node_template_list(request):
@@ -2464,6 +2724,7 @@ def edit_node_template_list(request, node_template_id):
     except Exception as e:
         return JsonResponse({"status": "error", "message": str(e)}, status=400)
 
+
 @require_http_methods(["DELETE"])
 def delete_node_template_list(request, node_template_id):
     try:
@@ -2479,9 +2740,12 @@ def delete_node_template_list(request, node_template_id):
         # 其他错误，返回500错误
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
+
 '''
 IP映射表
 '''
+
+
 @require_http_methods(["POST"])
 def add_node_map_list(request):
     try:
@@ -2520,6 +2784,7 @@ def add_node_map_list(request):
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
+
 def get_node_interfaces(request):
     try:
         # 获取查询参数
@@ -2546,13 +2811,14 @@ def get_node_interfaces(request):
                     'interfaceIndex': str(interface.interfaceIndex),
                     'nodeInterfaceIp': interface.interfaceIp,
                     'nodeInterfaceType': interface.interfaceType,
-                    "is_default":interface.is_default
+                    "is_default": interface.is_default
                 })
 
         return JsonResponse(interface_list, safe=False)
 
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
 
 @require_http_methods(["DELETE"])
 def delete_node_map_list(request, mapping_id):
@@ -2567,6 +2833,7 @@ def delete_node_map_list(request, mapping_id):
 
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
 
 @require_http_methods(["PUT"])
 def edit_node_map_list(request, mapping_id):
@@ -2590,7 +2857,7 @@ def edit_node_map_list(request, mapping_id):
             interfaceIp=interface_ip,
             node__sceneId=mapping.sceneId.id
         )
-        print('interface_ip:{}',interface_ip,mapping.sceneId.id)
+        print('interface_ip:{}', interface_ip, mapping.sceneId.id)
         # 检查是否找到接口
         if not interfaces.exists():
             return JsonResponse({'status': 'error', 'message': 'Interface not found'}, status=400)
@@ -2614,6 +2881,7 @@ def edit_node_map_list(request, mapping_id):
         return JsonResponse({'status': 'error', 'message': 'Invalid JSON format'}, status=400)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+
 
 @require_http_methods(["GET"])
 def get_map_list(request):
@@ -2677,7 +2945,7 @@ def generate_exata_config(request):
         exata_config_data = {
             'scene': scene,
             'nodes': Node.objects.filter(sceneId=scene).prefetch_related('interfaces'),
-            'links': Link.objects.filter(sceneId=scene).select_related('sourceInterface','destinationInterface'),
+            'links': Link.objects.filter(sceneId=scene).select_related('sourceInterface', 'destinationInterface'),
             'simulation_duration': simulation_duration  # 新增持续时间参数
         }
 
@@ -2690,6 +2958,8 @@ def generate_exata_config(request):
     except Exception as e:
         logger.error(f'Error generating Exata config: {str(e)}', exc_info=True)
         return HttpResponse(f'Error generating Exata config: {str(e)}', status=500)
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def configure_protocol(request, node_id, interfaceIndex):
@@ -2895,6 +3165,8 @@ def get_interface_config(request, node_id, interfaceIndex):
 '''
 生成文件
 '''
+
+
 def generate_link_file(request):
     try:
         # 获取查询参数
@@ -2976,8 +3248,6 @@ def generate_orbit_file(request):
         return HttpResponse(f'Error generating orbit file: {str(e)}', status=500)
 
 
-
-
 def generate_node_file(request):
     try:
         # 获取查询参数
@@ -3014,7 +3284,6 @@ def generate_node_file(request):
 
     except Exception as e:
         return HttpResponse(f'Error generating node file: {str(e)}', status=500)
-
 
 
 def generate_fault_file(request):
@@ -3064,7 +3333,6 @@ def generate_fault_file(request):
         return HttpResponse(f'Error generating fault file: {str(e)}', status=500)
 
 
-
 def generate_initial_file(request):
     try:
         # 获取查询参数
@@ -3097,222 +3365,62 @@ def generate_initial_file(request):
     except Exception as e:
         return HttpResponse(f'Error generating initial file: {str(e)}', status=500)
 
-'''
-生成文件
-'''
-'''
-def generate_scene_app(request,):
-    scene_id = request.GET.get('sceneId')
-    try:
-        scene = Scene.objects.get(pk=scene_id)
-    except Scene.DoesNotExist:
-        return HttpResponse("Scene not found", status=404)
 
-    configurations = Configuration.objects.filter(sceneId=scene)
+def format_slot_table(node_id_map: dict, data: list) -> str:
+    """
+    使用数据库中的 slot_table_data，结合 node_id_map 转换为字符串
+    :param node_id_map: dict, 业务名到节点ID的映射
+    :param data: list, 从数据库取到的 slot 表数据
+    :return: str, 格式化后的文本
+    """
+    if not data:
+        return ""
 
-    response = HttpResponse(content_type='text/plain')
-    response['Content-Disposition'] = f'attachment; filename="场景名称_{scene_id}.app"'
+    lines = []
+    for item in data:
+        head = item.get("head")
+        members = item.get("member", [])
 
-    for config in configurations:
-        if config.businessType == 'CBR':
-            start_time = config.cbrStartTime
-            end_time = config.cbrEndTime
-            packet_count = 0
-            packet_size = config.cbrPacketSize
-            interval = config.cbrSendInterval
-        elif config.businessType == 'FTP':
-            start_time = config.ftpStartTime
-            end_time = None
-            packet_count = config.ftpPacketCount
-            packet_size = 0
-            interval = 0
-        else:
-            continue
+        # head 映射到 id
+        head_id = node_id_map.get(head, head)
 
-        # 将开始时间和结束时间转换为相对于场景开始时间的秒数
-        time_offset = 0
-        if start_time:
-            time_offset = (start_time - scene.startTime).total_seconds()
+        # members 映射到 id
+        member_ids = [str(node_id_map.get(m, m)) for m in members]
 
-        end_time_offset = 0
-        if end_time:
-            end_time_offset = (end_time - scene.startTime).total_seconds()
-
-        # 构建文件行
-        config_line = f"{config.businessType} {config.sourceNodeId.id} {config.destinationNodeId.id} {packet_count} {packet_size} {interval} {int(time_offset)} {int(end_time_offset)}\n"
-        response.write(config_line)
-
-    return response
+        lines.append(str(head_id))
+        lines.append(" ".join(member_ids))
+    # 拼接成字符串，并保证最后一行末尾有一个空格
+    result = "\n".join(lines)
+    return result + " "
 
 
-def generate_scene_nodes(request):
-    # 从请求中获取sceneId参数
-    scene_id = request.GET.get('sceneId')
-    if not scene_id:
-        return HttpResponse('Error: Missing sceneId parameter', status=400)
+@csrf_exempt
+def save_slot_table(request):
+    if request.method == "POST":
+        try:
+            scene_id = request.GET.get("sceneId")  # 从 ?sceneId=28 里取
+            if not scene_id:
+                return JsonResponse({"status": "error", "message": "sceneId missing"}, status=400)
 
-    try:
-        # 尝试将sceneId转换为整数
-        scene_id = int(scene_id)
-    except ValueError:
-        return HttpResponse('Error: Invalid sceneId parameter', status=400)
+            # 查找场景
+            try:
+                scene = Scene.objects.get(id=scene_id)
+            except Scene.DoesNotExist:
+                return JsonResponse({"status": "error", "message": "Scene not found"}, status=404)
 
-    try:
-        # 检索指定场景
-        scene = Scene.objects.get(pk=scene_id)
-    except Scene.DoesNotExist:
-        return HttpResponse('Error: Scene not found', status=404)
+            # 解析 body
+            body_unicode = request.body.decode('utf-8')
+            data = json.loads(body_unicode)
+            print(f"前端给的数据：{data}")
 
-    # 获取场景中所有的节点
-    nodes = Node.objects.filter(Q(sceneId=scene)).order_by('id')
+            # 存数据库
+            SlotTable.objects.create(scene=scene, data=data)
 
-    # 创建HTTP响应对象，设置内容类型为纯文本
-    response = HttpResponse(content_type='text/plain')
-    # 设置响应头，指定文件名为场景名称加.nodes后缀
-    response['Content-Disposition'] = f'attachment; filename="{scene.sceneName}.nodes"'
-
-    # 处理每个节点并写入响应内容
-    for node in nodes:
-        node_line = ''
-        # 添加节点ID
-        node_line += f"{node.id} "
-
-        # 计算节点开始时间相对于场景开始时间的秒数
-        if node.startTime and scene.startTime:
-            time_offset = (node.startTime - scene.startTime).total_seconds()
-        else:
-            time_offset = 0
-        node_line += f"{int(time_offset)} "
-
-        # 添加经纬度和高度
-        if node.nodeType == 'normalNode':
-            node_line += f"{node.lat if node.lat is not None else 0} {node.lon if node.lon is not None else 0} {node.alt if node.alt is not None else 0}"
-        else:
-            # 对于非普通节点类型，提供默认值
-            node_line += "0 0 0"
-
-        # 添加三个0
-        node_line += " 0 0 0"
-
-        # 换行
-        node_line += "\n"
-
-        # 将构建好的节点行写入响应
-        response.write(node_line)
-
-    return response
-
-
-def generate_scene_fault(request):
-    # 从请求中获取sceneId参数
-    scene_id = request.GET.get('sceneId')
-    if not scene_id:
-        return HttpResponse('Error: Missing sceneId parameter', status=400)
-
-    try:
-        # 尝试将sceneId转换为整数
-        scene_id = int(scene_id)
-    except ValueError:
-        return HttpResponse('Error: Invalid sceneId parameter', status=400)
-
-    try:
-        # 检索指定场景
-        scene = Scene.objects.get(pk=scene_id)
-    except Scene.DoesNotExist:
-        return HttpResponse('Error: Scene not found', status=404)
-
-    # 获取场景中所有的链路错误
-    link_errors = LinkError.objects.filter(sceneId=scene)
-
-    # 创建HTTP响应对象，设置内容类型为纯文本
-    response = HttpResponse(content_type='text/plain')
-    # 设置响应头，指定文件名为场景名称加.fault后缀
-    response['Content-Disposition'] = f'attachment; filename="{scene.sceneName}.fault"'
-
-    # 处理每个链路错误并写入响应内容
-    for link_error in link_errors:
-        link = link_error.linkId
-        source_node = link.sourceNodeId
-        destination_node = link.destinationNodeId
-
-        # 计算错误开始时间和结束时间相对于场景开始时间的秒数
-        if link_error.errorStartTime and scene.startTime:
-            start_time_offset = (link_error.errorStartTime - scene.startTime).total_seconds()
-        else:
-            start_time_offset = 0
-
-        if link_error.errorEndTime and scene.startTime:
-            end_time_offset = (link_error.errorEndTime - scene.startTime).total_seconds()
-        else:
-            end_time_offset = 0
-
-        # 获取源节点和目的节点的所有接口序号
-        source_interfaces = Interface.objects.filter(node=source_node)
-        destination_interfaces = Interface.objects.filter(node=destination_node)
-
-        # 构建文件行
-        for source_interface in source_interfaces:
-            for destination_interface in destination_interfaces:
-                # 假设子网ID为1
-                fault_line = f"INTERFACE-FAULT LINK1/{source_node.id}/{source_interface.interfaceIndex} {int(start_time_offset)}S {int(end_time_offset)}S NO\n"
-                response.write(fault_line)
-                fault_line = f"INTERFACE-FAULT LINK1/{destination_node.id}/{destination_interface.interfaceIndex} {int(start_time_offset)}S {int(end_time_offset)}S NO\n"
-                response.write(fault_line)
-
-    return response
-def generate_display_file(request):
-    scene_id = request.GET.get('sceneId')
-    if not scene_id:
-        return HttpResponse('Error: Missing sceneId parameter', status=400)
-
-    try:
-        scene_id = int(scene_id)
-    except ValueError:
-        return HttpResponse('Error: Invalid sceneId parameter', status=400)
-
-    try:
-        scene = Scene.objects.get(pk=scene_id)
-    except Scene.DoesNotExist:
-        return HttpResponse('Error: Scene not found', status=404)
-
-    display_content = (
-        "[General]\n"
-        "showAnimation=false\n"
-        "showLegend=true\n"
-        "showNodeIds=true\n"
-        "showHierarchy=true\n"
-        "showHierarchyDisplay=true\n"
-        "showIpAddresses=false\n"
-        "showWiredLinks=true\n"
-        "showAppLinks=true\n"
-        "showGrid=true\n"
-        "showBgImages=true\n"
-        "showWeather=true\n"
-        "showHierarchyNames=false\n"
-        "showPatterns=true\n"
-        "showNightView=false\n"
-        "showHostNames=false\n"
-        "showInterfaceNames=true\n"
-        "showWirelessSubnets=true\n"
-        "showSatelliteLinks=true\n"
-        "showRuler=true\n"
-        "showWaypoint=true\n"
-        "showAnnotations=true\n"
-        "showAsIds=false\n"
-        "showQueues=false\n"
-        "showAxes=false\n"
-        "nodeOrientationIcon=true\n"
-        "nodeOrientationArrow=true\n"
-        "viewHeatMapInDesignMode=false\n"
-        "runTimeIndicator=false"
-    )
-
-    response = HttpResponse(content_type='text/plain')
-    response['Content-Disposition'] = f'attachment; filename="{scene.sceneName}.display"'
-    response.write(display_content)
-    return response
-'''
-
+            return JsonResponse({"status": "success"})
+        except Exception as e:
+            return JsonResponse({"status": "error", "message": str(e)})
+    else:
+        return JsonResponse({"status": "error", "message": "POST only"})
 
 def download_all_files(request):
     scene_id = request.GET.get('sceneId')
@@ -3331,6 +3439,7 @@ def download_all_files(request):
 
     # 创建场景文件夹
     scene_folder = os.path.join(settings.MEDIA_ROOT, 'scene_files', scene.sceneName)
+    print(scene_folder)
     os.makedirs(scene_folder, exist_ok=True)  # 确保文件夹存在
 
     # 清空现有文件夹内容
@@ -3344,7 +3453,7 @@ def download_all_files(request):
 
     # 计算仿真持续时间
     time_delta = scene.endTime - scene.startTime
-    simulation_duration = int(time_delta.total_seconds() // 60)
+    simulation_duration = int(time_delta.total_seconds())
 
     # 获取所有相关数据
     links = Link.objects.filter(sceneId=scene).select_related('sourceInterface', 'destinationInterface')
@@ -3352,8 +3461,6 @@ def download_all_files(request):
     satellites = Node.objects.filter(sceneId=scene, nodeType='satellite')
     normal_nodes = Node.objects.filter(sceneId=scene, nodeType='normalNode')
     errors = Error.objects.filter(sceneId=scene)
-    # 计算最大节点 ID
-    max_node_id = nodes.aggregate(max_id=Max('id'))['max_id'] or 0
     count = Node.objects.filter(sceneId=scene).count()
     num_nodes = count
     # 查找默认子网（假设名为"默认无线子网"）
@@ -3367,27 +3474,56 @@ def download_all_files(request):
         interfaces__subnet=default_subnet
     ).distinct()
     # 获取孤立节点ID列表
-    isolated_node_ids = [str(node.id) for node in isolated_nodes]
+    isolated_node_ids = [node.id for node in isolated_nodes]
+
     # 获取所有子网
-    all_subnets = Subnet.objects.filter(sceneId=scene,subnetType = Subnet.SubnetTypeChoices.SUB).prefetch_related('interfaces__node')
-    # 分离默认子网与其他子网
+    all_subnets = Subnet.objects.filter(sceneId=scene, subnetType=Subnet.SubnetTypeChoices.SUB).prefetch_related(
+        'interfaces__node')
+    # 分离默认子网与其他子网，exata中默认子网不显示 云
     subnets = all_subnets.exclude(id=default_subnet.id if default_subnet else None)
-    print(subnets)
+    # 判断是否需要写 .app 文件，与故障同理。
+    has_app_data = Configuration.objects.filter(sceneId=scene).exists()
+    # 判断是否需要写 .fault 文件，如果没有故障，不要往config里写入，不然会报错。
+    has_fault_data = LinkError.objects.filter(sceneId=scene).exists() or Error.objects.filter(sceneId=scene).exists()
+    # 节点 ID 映射
+    node_id_map = {node.id: idx + 1 for idx, node in enumerate(nodes)}
+    # 链路 ID 映射
+    link_id_map = {link.id: idx + 1 for idx, link in enumerate(links)}
+    # 子网 ID 映射（包含 default_subnet + 其他 subnets）
+    all_subnets_for_mapping = [s for s in all_subnets]  # QuerySet 转 list，保证顺序
+    subnet_id_map = {subnet.id: idx + 1 for idx, subnet in enumerate(all_subnets_for_mapping)}
+    # 转换成映射后的 id 列表,用来往子网写入
+    isolated_node_ids_mapped = [node_id_map[nid] for nid in isolated_node_ids]
+    print(node_id_map)
+    print(link_id_map)
+    print(subnet_id_map)
     # 准备模板数据
     exata_config_data = {
         'scene': scene,
-        'num_nodes':num_nodes,
+        'num_nodes': num_nodes,
         'nodes': nodes,
         'links': links,
         'simulation_duration': simulation_duration,
         'default_subnet': default_subnet,
         'subnets': subnets,
-        'isolated_node_ids': isolated_node_ids
+        # 'isolated_node_ids': isolated_node_ids,
+        'isolated_node_ids': isolated_node_ids_mapped,
+        "include_app_config": has_app_data,
+        "include_fault_config": has_fault_data,
+        "node_id_map": node_id_map,
+        "link_id_map": link_id_map,
     }
 
-    # 生成 Exata 配置文件内容
-    exata_config_content = render_to_string('exata/exata_config.template', exata_config_data)
+    # # 生成 Exata 配置文件内容
+    # exata_config_content = render_to_string('exata/exata_config.template', exata_config_data)
 
+    # 假设你的模板在 templates/exata/ 目录下,使用jinja2模板
+    TEMPLATE_DIR = Path(__file__).resolve().parent / 'templates'
+    env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)),
+    lstrip_blocks=True)
+    template = env.get_template('exata/exata_config.template')
+
+    exata_config_content = template.render(exata_config_data)
     # 保存到文件
     config_path = os.path.join(scene_folder, f"{scene.sceneName}.config")
     with open(config_path, 'w', encoding='utf-8') as f:
@@ -3402,16 +3538,17 @@ def download_all_files(request):
     response.write(exata_config_content + "\n\n")
 
     # 生成并保存 .app 文件
-    app_content = generate_scene_app_content(scene)
-    app_path = os.path.join(scene_folder, f"{scene.sceneName}.app")
-    with open(app_path, 'w', encoding='utf-8') as f:
-        f.write(app_content)
+    if has_app_data:
+        app_content = generate_scene_app_content(scene,node_id_map)
+        app_path = os.path.join(scene_folder, f"{scene.sceneName}.app")
+        with open(app_path, 'w', encoding='utf-8') as f:
+            f.write(app_content)
 
-    response.write(f"[{scene.sceneName}.app]\n")
-    response.write(app_content + "\n\n")
+        response.write(f"[{scene.sceneName}.app]\n")
+        response.write(app_content + "\n\n")
 
-    # 生成并保存 .nodes 文件
-    nodes_content = generate_scene_nodes_content(scene)
+    # 生成并保存 .nodes 文件,都加入节点映射。
+    nodes_content = generate_scene_nodes_content(scene,node_id_map)
     nodes_path = os.path.join(scene_folder, f"{scene.sceneName}.nodes")
     with open(nodes_path, 'w', encoding='utf-8') as f:
         f.write(nodes_content)
@@ -3419,14 +3556,14 @@ def download_all_files(request):
     response.write(f"[{scene.sceneName}.nodes]\n")
     response.write(nodes_content + "\n\n")
 
-    # 生成并保存 .fault 文件
-    fault_content = generate_scene_fault_content(scene)
-    fault_path = os.path.join(scene_folder, f"{scene.sceneName}.fault")
-    with open(fault_path, 'w', encoding='utf-8') as f:
-        f.write(fault_content)
-
-    response.write(f"[{scene.sceneName}.fault]\n")
-    response.write(fault_content + "\n\n")
+    if has_fault_data:
+        # 生成并保存 .fault 文件
+        fault_content = generate_scene_fault_content(scene,node_id_map)
+        fault_path = os.path.join(scene_folder, f"{scene.sceneName}.fault")
+        with open(fault_path, 'w', encoding='utf-8') as f:
+            f.write(fault_content)
+        response.write(f"[{scene.sceneName}.fault]\n")
+        response.write(fault_content + "\n\n")
 
     # 生成并保存 .display 文件
     display_content = generate_display_file_content(scene)
@@ -3437,6 +3574,58 @@ def download_all_files(request):
     response.write(f"[{scene.sceneName}.display]\n")
     response.write(display_content + "\n\n")
 
+    """
+    根据场景 scene 的节点 specialType 自动生成 level.txt
+    保存到 scene_folder/level.txt
+    """
+    # 1. 获取该场景所有节点，按 specialType 分组
+    nodes = scene.nodes.all()
+    type_dict = {}
+    for node in nodes:
+        key = node.specialType or "Unknown"
+        type_dict.setdefault(key, []).append(node.id)
+
+    # 2. 按需求顺序输出，如果顺序固定，可手动定义
+    type_order = [
+        "GEO",
+        "PrimaryRegion",
+        "SecondaryRegion",
+        "GuidedMissile",
+        "LEO"
+    ]
+
+    link_content = []
+
+    for t in type_order:
+        ids = type_dict.get(t)
+        if not ids:
+            continue
+        # 写 specialType
+        link_content.append(f"{t}\n")
+        # 写节点 id，按升序排列并空格分隔
+        id_line = " ".join(str(node_id_map[i]) for i in sorted(ids))
+        link_content.append(f"{id_line}\n")
+
+    # 3. 保存文件
+    level_path = os.path.join(scene_folder, "level.txt")
+    with open(level_path, 'w', encoding='utf-8') as f:
+        f.writelines(link_content)
+
+    # 生成 slotTable.txt
+    # 从数据库里取最新的一条 slot 表
+    slot_table_obj = SlotTable.objects.filter(scene=scene).order_by('-id').first()
+    if not slot_table_obj:
+        raise ValueError(f"Scene {scene.id} 没有 slot 表数据")
+
+    # 格式化
+    slot_table_data = format_slot_table(node_id_map, slot_table_obj.data)
+    print(f"要往文件里写的 slottable_data: {slot_table_data}")
+
+    # 写文件
+    slot_table_path = os.path.join(scene_folder, "slotTable.txt")
+    with open(slot_table_path, 'w', encoding='utf-8') as f:
+        f.writelines(slot_table_data)
+
     # 生成并保存 link.txt 文件
     link_content = []
     for link in links:
@@ -3444,7 +3633,7 @@ def download_all_files(request):
         destination_interfaceIp = link.destinationInterface.interfaceIp if link.destinationInterface else ""
         line = (
             f"{link.id} -1 "
-            f"{link.sourceNodeId.id} {link.destinationNodeId.id} "
+            f"{node_id_map[link.sourceNodeId.id]} {node_id_map[link.destinationNodeId.id]} "
             f"{link.sourceInterface.interfaceIndex if link.sourceInterface else ''} "
             f"{link.destinationInterface.interfaceIndex if link.destinationInterface else ''} "
             f"{source_interfaceIp} {destination_interfaceIp} "
@@ -3460,11 +3649,11 @@ def download_all_files(request):
     response.writelines(link_content)
     response.write("\n")
 
-    # 生成并保存 orbit.txt 文件
+    # 生成并保存 orbit.txt 文件,8.29一并对orbit.txt进行了节点映射
     orbit_content = []
     for satellite in satellites:
         line = (
-            f"{satellite.id} "
+            f"{node_id_map[satellite.id]} "
             f"{satellite.startTime.year} {satellite.startTime.month} {satellite.startTime.day} "
             f"{satellite.startTime.hour} {satellite.startTime.minute} {satellite.startTime.second} "
             f"{satellite.startTime.microsecond // 1000} "
@@ -3491,13 +3680,13 @@ def download_all_files(request):
     node_content = []
     for node in normal_nodes:
         line = (
-            f"{node.id} "
-            +"0 "+
-            f"{node.lat} "
-            f"{node.lon} "
-            f"{node.alt} "
-            f"{node.nodeImage} "
-            f"{node.nodeName}\n"
+                f"{node_id_map[node.id]} "
+                + "0 " +
+                f"{node.lat} "
+                f"{node.lon} "
+                f"{node.alt} "
+                f"{node.nodeImage} "
+                f"{node.nodeName}\n"
         )
         node_content.append(line)
 
@@ -3512,7 +3701,7 @@ def download_all_files(request):
     # 生成并保存 fault.txt 文件
     fault_txt_content = []
     for error in errors:
-        interfaces = Interface.objects.filter(node=error.nodeId)
+        interfaces = Interface.objects.filter(node=error.nodeId)#??故障节点还是接口，没有进行映射
         if not interfaces:
             continue
         start_time = (error.errorStartTime - scene.startTime).total_seconds()
@@ -3548,43 +3737,53 @@ def download_all_files(request):
     return response
 
 
-def generate_scene_app_content(scene):
+def generate_scene_app_content(scene,node_id_map):
     configurations = Configuration.objects.filter(sceneId=scene)
     content = ""
     for config in configurations:
         if config.businessType == 'CBR':
             start_time = config.cbrStartTime
             end_time = config.cbrEndTime
-            packet_count = 0
             packet_size = config.cbrPacketSize
             interval = config.cbrSendInterval
+
+            time_offset = (start_time - scene.startTime).total_seconds() if start_time else 0
+            end_time_offset = (end_time - scene.startTime).total_seconds() if end_time else 0
+
+            config_line = f"{config.businessType} {node_id_map[config.sourceNodeId.id]} {node_id_map[config.destinationNodeId.id]} 5000 {packet_size} {interval} {int(time_offset)} {int(end_time_offset)} {config.TransferType}\n"
+            content += config_line
+
         elif config.businessType == 'FTP':
             start_time = config.ftpStartTime
-            end_time = None
+            time_offset = (start_time - scene.startTime).total_seconds() if start_time else 0
             packet_count = config.ftpPacketCount
-            packet_size = 0
-            interval = 0
-        else:
-            continue
 
-        time_offset = 0
-        if start_time:
-            time_offset = (start_time - scene.startTime).total_seconds()
+            config_line = f"{config.businessType} {node_id_map[config.sourceNodeId.id]} {node_id_map[config.destinationNodeId.id]} {packet_count} {int(time_offset)}\n"
+            content += config_line
 
-        end_time_offset = 0
-        if end_time:
-            end_time_offset = (end_time - scene.startTime).total_seconds()
+        elif config.businessType == 'TRAFFIC-GEN':
+            config_line = f"{config.businessType} {node_id_map[config.sourceNodeId.id]} {node_id_map[config.destinationNodeId.id]} DET {config.tgStartTime} DET {config.tgDurationTime} RND DET {config.tgPacketSize} DET {config.tgSendInterval} 1.0 NOLB\n"
+            content += config_line
 
-        config_line = f"{config.businessType} {config.sourceNodeId.id} {config.destinationNodeId.id} {packet_count} {packet_size} {interval} {int(time_offset)} {int(end_time_offset)}\n"
-        content += config_line
+        elif config.businessType == 'HTTP':
+            num_servers = len(config.serverList) if config.serverList else 0
+            server_ids_str = ' '.join(str(node_id_map[sid]) for sid in config.serverList) if config.serverList else ''
+            config_line = f"{config.businessType} {node_id_map[config.clientId.id]} {num_servers} {server_ids_str} {config.httpStartTime} {config.httpThreshTime}\n"
+            content += config_line
+
+            # 多个 HTTPD 行
+            if config.serverList:
+                for server_id in config.serverList:
+                    content += f"HTTPD {node_id_map[server_id]}\n"
+
     return content
 
 
-def generate_scene_nodes_content(scene):
+def generate_scene_nodes_content(scene,node_id_map):
     nodes = Node.objects.filter(Q(sceneId=scene)).order_by('id')
     content = ""
     for node in nodes:
-        node_line = f"{node.id} "
+        node_line = f"{node_id_map[node.id]} "
         if node.startTime and scene.startTime:
             # time_offset = (node.startTime - scene.startTime).total_seconds()
             time_offset = 0
@@ -3602,34 +3801,58 @@ def generate_scene_nodes_content(scene):
     return content
 
 
-def generate_scene_fault_content(scene):
+def generate_scene_fault_content(scene,node_id_map):
+    result = []
+
+    def seconds_since_scene_start(time_point):
+        if not time_point:
+            return "0S"
+        return f"{int((time_point - scene.startTime).total_seconds())}S"
+
+    # 节点故障：写出该节点所有接口的故障（使用 subnet_id 或 link_id）
+    node_errors = Error.objects.filter(sceneId=scene)
+    for error in node_errors:
+        node = error.nodeId
+        interfaces = Interface.objects.filter(node=node)
+
+        start_time = seconds_since_scene_start(error.errorStartTime)
+        end_time = seconds_since_scene_start(error.errorEndTime)
+
+        for iface in interfaces:
+            iface_type = iface.interfaceType.upper()
+            iface_index = iface.interfaceIndex
+
+            if iface_type == "SUB":
+                id_part = f"SUB{iface.subnet.id if iface.subnet else 0}"
+            elif iface_type == "LINK":
+                link = Link.objects.filter(
+                    Q(sourceInterface=iface) | Q(destinationInterface=iface)
+                ).first()
+                id_part = f"LINK{link.id}" if link else "LINK0"
+            else:
+                id_part = "UNKNOWN"
+
+            line = f"INTERFACE-FAULT {id_part}/{node_id_map[node.id]}/{iface_index} {start_time} {end_time} NO"
+            result.append(line)
+
+    # 链路故障：只写链路的 sourceInterface 和 destinationInterface
+    # 使用链路 id 替代 subnet_id
     link_errors = LinkError.objects.filter(sceneId=scene)
-    content = ""
     for link_error in link_errors:
         link = link_error.linkId
-        source_node = link.sourceNodeId
-        destination_node = link.destinationNodeId
+        start_time = seconds_since_scene_start(link_error.errorStartTime)
+        end_time = seconds_since_scene_start(link_error.errorEndTime)
 
-        if link_error.errorStartTime and scene.startTime:
-            start_time_offset = (link_error.errorStartTime - scene.startTime).total_seconds()
-        else:
-            start_time_offset = 0
-
-        if link_error.errorEndTime and scene.startTime:
-            end_time_offset = (link_error.errorEndTime - scene.startTime).total_seconds()
-        else:
-            end_time_offset = 0
-
-        source_interfaces = Interface.objects.filter(node=source_node)
-        destination_interfaces = Interface.objects.filter(node=destination_node)
-
-        for source_interface in source_interfaces:
-            for destination_interface in destination_interfaces:
-                fault_line = f"INTERFACE-FAULT LINK1/{source_node.id}/{source_interface.interfaceIndex} {int(start_time_offset)}S {int(end_time_offset)}S NO\n"
-                content += fault_line
-                fault_line = f"INTERFACE-FAULT LINK1/{destination_node.id}/{destination_interface.interfaceIndex} {int(start_time_offset)}S {int(end_time_offset)}S NO\n"
-                content += fault_line
-    return content
+        for iface in [link.sourceInterface, link.destinationInterface]:
+            if iface is None:
+                continue  # 避免空接口导致报错
+            node = iface.node
+            iface_type = iface.interfaceType.upper()
+            iface_index = iface.interfaceIndex
+            link_id = link.id
+            line = f"INTERFACE-FAULT {iface_type}{link_id}/{node.id}/{iface_index} {start_time} {end_time} NO"
+            result.append(line)
+    return "\n".join(result)
 
 
 def generate_display_file_content(scene):
@@ -3666,7 +3889,6 @@ def generate_display_file_content(scene):
     )
 
 
-
 class ResultsAnalysis:
 
     def __init__(self, file_path):
@@ -3675,7 +3897,6 @@ class ResultsAnalysis:
         if not self.file_path.exists() or not self.file_path.is_file():
             raise ValueError(f"文件不存在或不是有效文件: {self.file_path}")
         self.directory = self.file_path.parent  # 存储文件所在目录
-
 
     def read_filter_file(self):
         """
@@ -3792,10 +4013,11 @@ class ResultsAnalysis:
                     # 获取收包
                     received = business_received.get(business_id, None)
                     if received is not None:
-                        results_received.append(['bar', business_id, info["start_node"] + '-' + info["end_node"], received])
+                        results_received.append(
+                            ['bar', business_id, info["start_node"] + '-' + info["end_node"], received])
 
                     # 获取业务丢包率
-                    drop = received / sent
+                    drop = 1 - received / sent
                     if drop is not None:
                         results_drop.append(['bar', business_id, info["start_node"] + '-' + info["end_node"], drop])
 
@@ -3810,7 +4032,8 @@ class ResultsAnalysis:
                     # 获取吞吐量值
                     throughput = business_throughput.get(business_id, None)
                     if throughput is not None:
-                        results_throughput.append(['bar', business_id, info["start_node"] + '-' + info["end_node"], throughput])
+                        results_throughput.append(
+                            ['bar', business_id, info["start_node"] + '-' + info["end_node"], throughput])
 
             results_sent_dic = {
                 'type': 'bar',
@@ -3860,13 +4083,104 @@ class ResultsAnalysis:
             json_results_delay = json.dumps(results_delay_dic)
             json_results_jitter = json.dumps(results_jitter_dic)
             json_results_throughput = json.dumps(results_throughput_dic)
-
+            print(json_results_sent)
             return json_results_sent, json_results_received, json_results_drop, json_results_delay, json_results_jitter, json_results_throughput
 
         except Exception as e:
             print(f"读取文件时发生错误: {e}")
 
 
+def analyze_exata_by_node_multi_flat(stat_file_path: str):
+    """
+    按节点ID解析业务数据
+    每个指标保存为 list[dict]，允许节点重复出现
+    """
+    path = Path(stat_file_path)
+    if not path.exists():
+        raise FileNotFoundError(f"文件不存在: {stat_file_path}")
+
+    results_sent = []
+    results_received = []
+    results_delay = []
+    results_jitter = []
+    results_throughput = []
+    results_time_range = []  # 新增：收包时间范围
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        first_time = None
+        last_time = None
+        current_node = None
+
+        for line in f:
+            fields = [field.strip() for field in line.split(',')]
+            if len(fields) < 5:
+                continue
+
+            node_id = fields[0].strip()  # 节点ID
+            current_node = node_id
+
+            # 发包
+            if "Total Unicast Fragments Sent" in line:
+                m = re.search(r"= ([\d\.]+)", line)
+                if m:
+                    results_sent.append({node_id: float(m.group(1))})
+
+            # 收包
+            if "Total Unicast Fragments Received" in line:
+                m = re.search(r"= ([\d\.]+)", line)
+                if m:
+                    results_received.append({node_id: float(m.group(1))})
+
+            # 时延
+            if "Average Unicast End-to-End Delay" in line:
+                m = re.search(r"= ([\d\.]+)", line)
+                if m:
+                    results_delay.append({node_id: float(m.group(1))})
+
+            # 抖动
+            if "Average Unicast Jitter" in line:
+                m = re.search(r"= ([\d\.]+)", line)
+                if m:
+                    results_jitter.append({node_id: float(m.group(1))})
+
+            # 吞吐量
+            if "Unicast Received Throughput" in line:
+                m = re.search(r"= ([\d\.]+)", line)
+                if m:
+                    results_throughput.append({node_id: float(m.group(1))})
+
+            # 收包始末时间
+            if "First Unicast Fragment Received" in line:
+                m = re.search(r"= ([\d\.]+)", line)
+                if m:
+                    first_time = float(m.group(1))
+
+            if "Last Unicast Fragment Received" in line:
+                m = re.search(r"= ([\d\.]+)", line)
+                if m:
+                    last_time = float(m.group(1))
+                    # 一旦拿到 last_time，说明一组完整的时间范围记录可以存储
+                    if first_time is not None:
+                        results_time_range.append({
+                            node_id: {
+                                "first": first_time,
+                                "last": last_time
+                            }
+                        })
+                        first_time = None
+                        last_time = None
+
+    # 拼接成大JSON
+    big_json = {
+        "sent": results_sent,
+        "received": results_received,
+        "delay": results_delay,
+        "jitter": results_jitter,
+        "throughput": results_throughput,
+        "time_range": results_time_range  # 新增
+    }
+
+    return big_json
 @require_http_methods(["GET"])  # 只允许GET请求
 def analysis_results(request):
     """处理分析结果请求的函数视图"""
@@ -3897,23 +4211,13 @@ def analysis_results(request):
                 "message": "非法路径"
             }, status=400)
 
-        # 创建分析实例
-        analyzer = ResultsAnalysis(full_path)
-        print('创建实力成功')
         # 获取分析结果
-        results = analyzer.read_filter_file()
+        results = analyze_exata_by_node_multi_flat(full_path)
 
         # 组织响应数据
         return JsonResponse({
             "status": "success",
-            "data": {
-                "sent": json.loads(results[0]),
-                "received": json.loads(results[1]),
-                "drop_rate": json.loads(results[2]),
-                "delay": json.loads(results[3]),
-                "jitter": json.loads(results[4]),
-                "throughput": json.loads(results[5])
-            }
+            "data": results
         })
 
     except Exception as e:
@@ -3978,12 +4282,14 @@ def get_scene_files(request):
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
-selected_scene = None
+selected_scene_name = None
+
+
 @require_http_methods(["POST"])
 @csrf_exempt
 def start_simulation(request):
     global absolute_path
-    global selected_scene
+    global selected_scene_name
     try:
         # 解析JSON请求体
         data = json.loads(request.body)
@@ -3998,14 +4304,12 @@ def start_simulation(request):
         try:
             # 获取场景对象
             scene = Scene.objects.get(id=scene_id)
+            selected_scene_name = scene.sceneName
         except Scene.DoesNotExist:
             return JsonResponse({
                 'status': 'error',
                 'message': f'场景ID {scene_id} 不存在'
             }, status=404)
-
-        # 设置当前选中的场景
-        selected_scene = scene_id
 
         # ====== 新增功能：获取并打印场景文件夹绝对路径 ======
         # 构建场景文件夹路径
@@ -4013,14 +4317,15 @@ def start_simulation(request):
             settings.MEDIA_ROOT,
             'scene_files',
             scene.sceneName  # 使用场景名称作为文件夹名
+            # 'fina1'
         )
 
         # path = r"C:\Users\lyk\Desktop\zuixinban\mytestdjango_five\scene1"
         # absolute_path = Path(path)
         # 获取绝对路径并打印
-        # absolute_path_str = os.path.abspath(scene_folder)
-        absolute_path =r"C:\Users\xukz1\Desktop\scene1\scene1"
-        absolute_path = Path(absolute_path)
+        absolute_path_str = os.path.abspath(scene_folder)
+        # absolute_path =r"C:\Users\xukz1\Desktop\scene1\scene1"
+        absolute_path = Path(absolute_path_str)
         print(type(absolute_path))
         print(f"场景文件夹绝对路径: {absolute_path}")
         # ====== 新增功能结束 ======
@@ -4044,6 +4349,240 @@ def start_simulation(request):
         }, status=500)
 
 
+
+
+def extract_node_from_filename(filename):
+    """从文件名提取节点编号，如queuesize_node1.txt → 1"""
+    match = re.search(r'node(\d+)', filename)
+    return int(match.group(1)) if match else 1  # 默认返回1如果未匹配到
+
+
+def find_queue_files(folder_path: str) -> List[str]:
+    """查找文件夹中所有符合 queuesize_node*.txt 格式的文件"""
+    pattern = os.path.join(folder_path, "queuesize_node*.txt")
+    return sorted(glob.glob(pattern), key=lambda x: extract_node_from_filename(x))
+
+
+def read_and_parse_files(file_paths: List[str]) -> Dict[str, Dict[str, List[int]]]:
+    """读取并解析多个文件的数据，返回格式为 {'node几': {VCID: [数值]}}"""
+    all_data = {}
+
+    for file_path in file_paths:
+        file_name = os.path.basename(file_path)
+        node_num = extract_node_from_filename(file_name)
+
+        try:
+            with open(file_path, 'r', encoding='gbk') as f:
+                lines = f.readlines()
+
+            # 动态构建正则模式（根据节点号变化）
+            pattern = fr'SID:{node_num}, VCID:(\d+)-(\d+)'
+
+            file_data = {}
+            for line_num, line in enumerate(lines, 1):
+                matches = re.findall(pattern, line)
+                #if not matches and line.strip():  # 非空行但未匹配时警告
+                    #print(f"line  {line_num}  no match: {line.strip()}")
+
+                for vcid, value in matches:
+                    key = f"VCID:{vcid}"
+                    file_data.setdefault(key, []).append(int(value))
+
+            # 使用 "node几" 作为键
+            node_key = f"node{node_num}"
+            all_data[node_key] = file_data
+
+        except Exception as e:
+            print(f"wrong with processing {file_name} : {str(e)}")
+
+    return all_data
+
+
+
+def analyze_queue_data(request):
+    scene_id = request.GET.get('sceneId')
+    try:
+        scene = Scene.objects.get(pk=scene_id)
+    except Scene.DoesNotExist:
+        return HttpResponse('Error: Scene not found', status=404)
+    # 构造文件夹路径
+    scene_folder = os.path.join(settings.MEDIA_ROOT, 'scene_files', scene.sceneName, 'outfile')
+    file_paths = find_queue_files(scene_folder)
+    if not file_paths:
+        print(f"在文件夹 {file_paths} 中未找到 queuesize_node*.txt 文件")
+
+
+    try:
+        data = read_and_parse_files(file_paths)
+        return JsonResponse({'data': data}, safe=False)
+    except FileNotFoundError as e:
+        return JsonResponse({'error': str(e)}, status=400)
+    except Exception as e:
+        return JsonResponse({'error': f'Internal error: {str(e)}'}, status=500)
+
+def extract_node_number(file_path):
+    """从文件名中提取节点编号"""
+    filename = os.path.basename(file_path)
+    digits = ''.join(filter(str.isdigit, filename))
+    return int(digits) if digits else 0
+
+
+def read_slot_stats(file_path):
+    """
+    读取单个文件，返回周期列表和每个接口的带宽利用率百分比字典
+    返回: (cycles, {interface_id: [percentages]})
+    """
+    raw_data = {}  # period -> {interface_id: value}
+    periods = set()
+
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            parts = line.split(',')
+            if len(parts) != 2:
+                continue
+
+            period_part, interface_part = parts
+
+            # 提取周期编号
+            if not period_part.startswith('period'):
+                continue
+            try:
+                period_num = int(period_part.replace('period', ''))
+            except ValueError:
+                continue
+
+            # 提取接口数据
+            if '::' not in interface_part:
+                continue
+
+            interface_name, value_str = interface_part.split('::', 1)
+            if not interface_name.startswith('interface'):
+                continue
+
+            try:
+                interface_id = int(interface_name.replace('interface', ''))
+                value = float(value_str) * 100.0  # 转换为百分比
+            except ValueError:
+                continue
+
+            periods.add(period_num)
+            if period_num not in raw_data:
+                raw_data[period_num] = {}
+            raw_data[period_num][interface_id] = value
+
+    # 按周期排序
+    sorted_periods = sorted(periods)
+    cycles = [p * 12 for p in sorted_periods]  # 转换为时间轴
+
+    # 收集所有接口
+    all_interfaces = set()
+    for period_data in raw_data.values():
+        all_interfaces.update(period_data.keys())
+    all_interfaces = sorted(all_interfaces)
+
+    # 为每个接口创建数据序列
+    interface_data = {}
+    for interface_id in all_interfaces:
+        interface_data[interface_id] = [raw_data.get(p, {}).get(interface_id, 0.0) for p in sorted_periods]
+
+    return cycles, interface_data
+
+
+def collect_bandwidth_data(folder_path):
+    """
+    收集所有节点的带宽和业务带宽数据，按照接口分开保存
+    {
+      "Node1": {
+        "time": [...],
+        "total_interfaces": {
+          "interface0": [...],
+          "interface8": [...]
+        },
+        "bus_interfaces": {
+          "interface0": [...],
+          "interface8": [...]
+        }
+      },
+      ...
+    }
+    """
+    result = {}
+
+    # 所有节点的 total
+    total_files = sorted(
+        glob.glob(os.path.join(folder_path, "slot_stats_node*.txt")),
+        key=extract_node_number
+    )
+    # 所有节点的 bus
+    bus_files = sorted(
+        glob.glob(os.path.join(folder_path, "busslot_stats_node*.txt")),
+        key=extract_node_number
+    )
+
+    # 然后收集数据
+    # 遍历 total 文件
+    for file_path in total_files:
+        node_num = extract_node_number(file_path)
+        cycles, interface_data = read_slot_stats(file_path)
+
+        node_key = f"Node{node_num}"
+        result[node_key] = {
+            "total_interfaces": {},
+            "bus_interfaces": {}  # 先留空
+        }
+
+        # 保存每个接口的数据
+        for interface_id, values in interface_data.items():
+            result[node_key]["total_interfaces"][f"interface{interface_id}"] = values
+
+    # 遍历 bus 文件，补充 bus_interfaces
+    for file_path in bus_files:
+        node_num = extract_node_number(file_path)
+        cycles, interface_data = read_slot_stats(file_path)
+
+        node_key = f"Node{node_num}"
+        if node_key not in result:
+            result[node_key] = {
+                "time": cycles,
+                "total_interfaces": {},
+                "bus_interfaces": {}
+            }
+
+        # 保存每个接口的数据
+        for interface_id, values in interface_data.items():
+            result[node_key]["bus_interfaces"][f"interface{interface_id}"] = values
+
+    return result
+
+
+def save_to_json(data, output_file):
+    """将数据保存为JSON文件"""
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def get_slot_stats_data(request):
+    scene_id = request.GET.get('sceneId')
+
+    try:
+        scene = Scene.objects.get(pk=scene_id)
+    except Scene.DoesNotExist:
+        return HttpResponse('Error: Scene not found', status=404)
+
+    # 构造文件夹路径
+    scene_folder = os.path.join(settings.MEDIA_ROOT, 'scene_files', scene.sceneName, 'outfile')
+
+    try:
+        node_data = collect_bandwidth_data(scene_folder)
+        return JsonResponse({'data': node_data}, safe=False)
+
+    except FileNotFoundError as e:
+        return JsonResponse({'error': str(e)}, status=400)
+    except Exception as e:
+        return JsonResponse({'error': f'Internal error: {str(e)}'}, status=500)
 
 
 
@@ -4080,7 +4619,8 @@ def sendtofrontbysocket(request, time, satellites, links, applications):
     # 将字典转换为 JSON 字符串
     message_json = json.dumps(message)
 
-    print(f"已发送消息：{message_json}")
+    # print(f"已发送消息：{message_json}")
+    #发送给前端的
 
     # 发送消息到 WebSocket 组
     async_to_sync(channel_layer.group_send)(
@@ -4223,7 +4763,7 @@ def cal_sat_pos(t):
     '''
     num = 0
     if (num == 0):
-        filee = open(absolute_path / 'config.txt', 'w', encoding='utf-8')
+        file = open(absolute_path / 'config.txt', 'w', encoding='utf-8')
     for sat in SocketView.sat_arr:
         # 使用timedelta将秒数转换为时间差
         time_difference = timedelta(seconds=t)
@@ -4258,16 +4798,9 @@ def cal_sat_pos(t):
     SocketView.print_state = 1
 
 
-
 class SocketView(View):
-
-    carStart = 0
+    startSign = False
     link_x = 1
-    cari = 0
-    car_info1 = []
-    car_info2 = []
-    car_info3 = []
-    car_info4 = []
     ddk1 = 1
     i = 0
     ddk2 = 1
@@ -4316,11 +4849,11 @@ class SocketView(View):
     stop_handle_message = 0
     stop_send_message = 0
     ip_list = []
-    link_state = []
-    time_link_state = []  #包含上个时间片内的全部链路数据包消息
+    receive_link_state = []
+    time_receive_link_state = []  #包含上个时间片内的全部链路数据包消息
     update_links = []
     json_list = []
-    message_prefixes = ['16000000000000', '07000000000000', '000000000000000a', ]
+    message_prefixes = ['16000000000000', '07000000000000', '000000000000000a', '0e01000000', ]
 
     @staticmethod
     def set_isPaused(value):
@@ -4396,15 +4929,14 @@ class SocketView(View):
                                key=lambda x: int(x["satellite_id"].split("_")[1])):
                 cfg.write(
                     f"CREATEPLATFORM {info['satellite_id'].split('_')[1]} 0 "
-                    f"LAT {int(float(info['lat']))} "
-                    f"LON {int(float(info['lon']))} "
-                    f"ALT {int(float(info['alt']))} "
+                    f"LAT {float(info['lat'])} "
+                    f"LON {float(info['lon'])} "
+                    f"ALT {float(info['alt'])} "
                     f"DAMAGESTATE 0 Type 1\n"
                 )
                 SocketView.normal_node.append(info)
 
         return {"node": SocketView.normal_node}
-
 
     def connect_to_server(self):
 
@@ -4417,21 +4949,13 @@ class SocketView(View):
             server_address = '127.0.0.1'
             server_port = 8005
             SocketView.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            for attempt in range(5):
-                try:
-                    SocketView.client_socket.connect((server_address, server_port))
-                    SocketView.receive_thread = threading.Thread(target=self.receive_message,
-                                                                 daemon=True).start()  # 不要加括号
-                    SocketView.handle_thread = threading.Thread(target=self.handle_message,
-                                                                daemon=True).start()  # 不要加括号
-                    print(f"成功连接: {SocketView.client_socket}")
-                    return {"status": "成功连接"}
-                except socket.error as e:
-                    return {"status": f"连接失败: {e}"}
-        else:
-            SocketView.client_socket.close()
-            SocketView.client_socket = None
-            return {"status": "上次连接未断开"}
+
+            SocketView.client_socket.connect((server_address, server_port))
+            SocketView.receive_thread = threading.Thread(target=self.receive_message,
+                                                         daemon=True).start()  # 不要加括号
+            SocketView.handle_thread = threading.Thread(target=self.handle_message,
+                                                        daemon=True).start()  # 不要加括号
+            print(f"成功连接: {SocketView.client_socket}")
 
     def handle_message(self):
         while True:
@@ -4451,9 +4975,9 @@ class SocketView(View):
                     # 使用decode()方法将字节串转换为字符串
                     str_data = original_string.decode('utf-8')
                     split_values = str_data.split()
-                    # print(f"str_data is :{str_data}")
+
                     if split_values[5] == "0":
-                        SocketView.link_state.append({
+                        SocketView.receive_link_state.append({
                             "source_satellite_id": split_values[0],
                             "destination_satellite_id": split_values[1],
                             "source_satellite_interface": split_values[2],
@@ -4462,7 +4986,9 @@ class SocketView(View):
                             "type": "network_layer"
                         })
                     else:
-                        SocketView.link_state.append({
+                        if split_values[0] == "4294967295":
+                            print(f"str_data is :{str_data}")
+                        SocketView.receive_link_state.append({
                             "source_satellite_id": split_values[0],
                             "destination_satellite_id": split_values[1],
                             "source_satellite_interface": split_values[2],
@@ -4474,17 +5000,31 @@ class SocketView(View):
                             "app_des_id": split_values[8],
 
                         })
-                    # sendlinkstatetofrontbysocket(self, SocketView.link_state[-1])
+
+                    # sendlinkstatetofrontbysocket(self, SocketView.receive_link_state[-1])
 
                     # print(f"恢复的数字是{str_data}")
+                if SocketView.handleMessage.startswith('0e'):
+                    data = bytes.fromhex(SocketView.handleMessage)
+
+                    # 2. 根据分析，字符串长度位于第11个字节 (索引为10)
+                    # 0x2c 转换为十进制是 44，这就是字符串的长度
+                    string_length = data[10]
+
+                    # 3. 字符串内容从第12个字节 (索引为11) 开始
+                    start_index = 11
+                    end_index = start_index + string_length
+
+                    # 4. 提取字节切片并用UTF-8解码为字符串
+                    error_message = data[start_index:end_index].decode('utf-8')
+                    # print(f"错误:{error_message}")
                 if not SocketView.get_isStep():
                     # SocketView.handleMessage = SocketView.receive_queue[0]
 
                     if SocketView.handleMessage.startswith('07') and not SocketView.get_isPaused():
                         self.update_link_data()
                         SocketView.exataisidle = True
-                        # SocketView.set_isPaused(False)
-                        print(f"SocketView.exataisidle 已经被设为true {SocketView.exataisidle}")
+                        # print(f"SocketView.exataisidle 已经被设为true {SocketView.exataisidle}")
                         SocketView.receive_queue.remove(SocketView.receive_queue[0])
                         # SocketView.handleMessage_queue.append(SocketView.handleMessage)
                     elif not SocketView.handleMessage.startswith('07'):
@@ -4496,6 +5036,7 @@ class SocketView(View):
                     if SocketView.handleMessage.startswith('07') and not SocketView.get_isPaused():
                         print(f"SocketView.exataisidle 步进中已经被设为true {SocketView.exataisidle}")
                         if SocketView.hasbeenstep:
+                            self.pause_simulation()
                             self.pause_simulation()
                         else:
                             self.update_link_data()
@@ -4513,25 +5054,34 @@ class SocketView(View):
             # 当仿真结束时，关闭线程
             # time.sleep(1)
 
+    def _dict_to_socketview(d: dict) -> "SocketView":
+        sv = SocketView()
+        sv.link_id = d.get("link_id")
+        sv.time = d.get("time", -1)
+        sv.node1 = d.get("node1")
+        sv.node2 = d.get("node2")
+        sv.interface1 = d.get("interface1")
+        sv.interface2 = d.get("interface2")
+        sv.ip1 = d.get("ip1", 0)
+        sv.ip2 = d.get("ip2", 0)
+        sv.link_type = d.get("link_type", "application_layer")
+        sv.flag1 = d.get("flag1", 0)
+        sv.flag2 = d.get("flag2", 0)
+        sv.active_time1 = d.get("active_time1", 0)
+        sv.active_time2 = d.get("active_time2", 0)
+        sv.application_from_direction1 = d.get("application_from_direction1", 0)
+        sv.application_from_direction2 = d.get("application_from_direction2", 0)
+        sv.app_id1 = d.get("app_id1")
+        sv.app_source_id1 = d.get("app_source_id1")
+        sv.app_des_id1 = d.get("app_des_id1")
+        sv.app_id2 = d.get("app_id2")
+        sv.app_source_id2 = d.get("app_source_id2")
+        sv.app_des_id2 = d.get("app_des_id2")
+        sv.app_1 = d.get("app_1")
+        sv.app_2 = d.get("app_2")
+        return sv
+
     def update_link_data(self):
-        if SocketView.car_info1:
-            satellite_id_to_replace = SocketView.car_info1["satellite_id"]
-            found = False
-
-            for idx, satellite in enumerate(SocketView.satellites):
-                if satellite["satellite_id"] == satellite_id_to_replace:
-                    # 如果找到了，替换掉这个对象
-                    SocketView.satellites[idx] = SocketView.car_info1
-                    found = True
-                    break  # 找到后直接退出循环
-
-            # 如果没有找到相同satellite_id的对象
-            if not found:
-                SocketView.satellites.append(SocketView.car_info1)
-                print("not found\n")
-            else:
-                print("found\n")
-
         SocketView.update_links = []
         SocketView.update_links = [SocketView() for _ in
                                    range(len(StaticDynamicLinkCalculator.static_link))]
@@ -4550,9 +5100,10 @@ class SocketView(View):
             update_link.ip1 = ip1
             update_link.ip2 = ip2
             update_link.link_type = link_type
-            # 设置第 9 和第 10 个属性
+            # flag1和flag2判断网络层两个方向的通断
             update_link.flag1 = 0
             update_link.flag2 = 0
+            # activetime记录连通的时间
             update_link.active_time1 = 0
             update_link.active_time2 = 0
             update_link.application_from_direction1 = 0
@@ -4563,18 +5114,21 @@ class SocketView(View):
             update_link.app_id2 = None
             update_link.app_source_id2 = None
             update_link.app_des_id2 = None
+            # app_1是一个三维的json数组
             update_link.app_1 = None
             update_link.app_2 = None
-        # 遍历 link_state 和 update_links，进行匹配并更新 update_link 对象
+        # 遍历 receive_link_state 和 update_links，进行匹配并更新 update_link 对象
         applications = []
-        for link_state_obj in SocketView.link_state:
-            # print(f"更新对象1")
-            if link_state_obj["type"] == "network_layer":
-                source_satellite_id = int(link_state_obj["source_satellite_id"])
-                destination_satellite_id = int(link_state_obj["destination_satellite_id"])
-                source_satellite_interface = int(link_state_obj["source_satellite_interface"])
-                destination_satellite_interface = int(link_state_obj["destination_satellite_interface"])
-                time = int(link_state_obj["time"])
+        with open("debug_log.txt", "a", encoding="utf-8") as f:
+            f.write(str(SocketView.receive_link_state) + "\n\n\n")
+        for receive_link_state_obj in SocketView.receive_link_state:
+            # 这个if判断网络层是不是通的，
+            if receive_link_state_obj["type"] == "network_layer":
+                source_satellite_id = int(receive_link_state_obj["source_satellite_id"])
+                destination_satellite_id = int(receive_link_state_obj["destination_satellite_id"])
+                source_satellite_interface = int(receive_link_state_obj["source_satellite_interface"])
+                destination_satellite_interface = int(receive_link_state_obj["destination_satellite_interface"])
+                time = int(receive_link_state_obj["time"])
                 # print(f"更新对象2")
                 # 遍历 update_links，检查是否有匹配的 link
                 for update_link in SocketView.update_links:
@@ -4583,7 +5137,7 @@ class SocketView(View):
                     interface1 = int(update_link.interface1)
                     interface2 = int(update_link.interface2)
                     # print(
-                    #     f"link_state -> source_satellite_id: {source_satellite_id}, destination_satellite_id: {destination_satellite_id}, "
+                    #     f"receive_link_state -> source_satellite_id: {source_satellite_id}, destination_satellite_id: {destination_satellite_id}, "
                     #     f"source_satellite_interface: {source_satellite_interface}, destination_satellite_interface: {destination_satellite_interface}")
                     # print(f"update_link -> node1: {node1}, node2: {node2}, "
                     #       f"interface1: {interface1}, interface2: {interface2}")
@@ -4607,13 +5161,13 @@ class SocketView(View):
                         update_link.flag2 = 1
                         update_link.active_time2 = time
                         # print(f"更新对象: {update_link}, active_time2 设置为: {time}")
-            if link_state_obj["type"] == "application_layer":
-                source_satellite_id = int(link_state_obj["source_satellite_id"])
-                destination_satellite_id = int(link_state_obj["destination_satellite_id"])
-                source_satellite_interface = int(link_state_obj["source_satellite_interface"])
-                destination_satellite_interface = int(link_state_obj["destination_satellite_interface"])
-                time = int(link_state_obj["time"])
-
+            if receive_link_state_obj["type"] == "application_layer":
+                source_satellite_id = int(receive_link_state_obj["source_satellite_id"])
+                destination_satellite_id = int(receive_link_state_obj["destination_satellite_id"])
+                source_satellite_interface = int(receive_link_state_obj["source_satellite_interface"])
+                destination_satellite_interface = int(receive_link_state_obj["destination_satellite_interface"])
+                time = int(receive_link_state_obj["time"])
+                linkstate_used = 0
                 # print(f"更新对象2")
                 # 遍历 update_links，检查是否有匹配的 link
                 for update_link in SocketView.update_links:
@@ -4628,12 +5182,13 @@ class SocketView(View):
                             interface1 == source_satellite_interface and
                             interface2 == destination_satellite_interface):
 
+                        linkstate_used = 1
                         update_link.application_from_direction1 += 1
 
                         # 合并 app_id1, app_source_id1, app_des_id1 为 app_1
-                        new_app_id = str(link_state_obj["app_id"])
-                        new_app_source_id = str(link_state_obj["app_source_id"])
-                        new_app_des_id = str(link_state_obj["app_des_id"])
+                        new_app_id = str(receive_link_state_obj["app_id"])
+                        new_app_source_id = str(receive_link_state_obj["app_source_id"])
+                        new_app_des_id = str(receive_link_state_obj["app_des_id"])
 
                         # 合并这些值为一个 JSON 对象
                         app_1_info = {
@@ -4655,17 +5210,17 @@ class SocketView(View):
                             update_link.app_1 = [app_1_info]  # 如果没有旧值，初始化为一个包含当前合并信息的列表
 
                     # 检查是否匹配第二个方向的条件
-                    if (node1 == destination_satellite_id and
+                    elif (node1 == destination_satellite_id and
                             node2 == source_satellite_id and
                             interface1 == destination_satellite_interface and
                             interface2 == source_satellite_interface):
-
+                        linkstate_used = 1
                         update_link.application_from_direction2 += 1
 
                         # 合并 app_id2, app_source_id2, app_des_id2 为 app_2
-                        new_app_id = str(link_state_obj["app_id"])
-                        new_app_source_id = str(link_state_obj["app_source_id"])
-                        new_app_des_id = str(link_state_obj["app_des_id"])
+                        new_app_id = str(receive_link_state_obj["app_id"])
+                        new_app_source_id = str(receive_link_state_obj["app_source_id"])
+                        new_app_des_id = str(receive_link_state_obj["app_des_id"])
 
                         # 合并这些值为一个 JSON 对象
                         app_2_info = {
@@ -4687,12 +5242,12 @@ class SocketView(View):
                             update_link.app_2 = [app_2_info]  # 如果没有旧值，初始化为一个包含当前合并信息的列表
 
                     # print(
-                    #     f"link_state -> source_satellite_id: {source_satellite_id}, destination_satellite_id: {destination_satellite_id}, "
+                    #     f"receive_link_state -> source_satellite_id: {source_satellite_id}, destination_satellite_id: {destination_satellite_id}, "
                     #     f"source_satellite_interface: {source_satellite_interface}, destination_satellite_interface: {destination_satellite_interface}")
                     # print(f"update_link -> node1: {node1}, node2: {node2}, "
                     #       f"interface1: {interface1}, interface2: {interface2}")
 
-                    # 进行匹配，第一个条件：从 source 到 destination
+                    # 如果两个节点之间存在业务，就默认网络层是通的
                     if (node1 == source_satellite_id and
                         node2 == destination_satellite_id and
                         interface1 == source_satellite_interface and
@@ -4705,7 +5260,71 @@ class SocketView(View):
                         update_link.active_time1 = time
                         update_link.flag2 = 1
                         update_link.active_time2 = time
-                        # print(f"更新对象: {update_link}, active_time1 设置为: {time}")
+                # if linkstate_used == 0:
+                #     # 计算新的 link_id
+                #     if SocketView.update_links:
+                #         last_item = SocketView.update_links[-1]
+                #         if isinstance(last_item, dict):
+                #             new_link_id = last_item["link_id"] + 1
+                #         else:  # SocketView 对象
+                #             new_link_id = last_item.link_id + 1
+                #     else:
+                #         new_link_id = 1  # 如果列表为空，从 1 开始
+                #
+                #     # 创建新字典
+                #     extra_dict = {
+                #         "link_id": new_link_id,
+                #         "time": int(-1),
+                #         "node1": source_satellite_id,
+                #         "node2": destination_satellite_id,
+                #         "interface1": source_satellite_interface,
+                #         "interface2": destination_satellite_interface,
+                #         "ip1": 0,
+                #         "ip2": 0,
+                #         "link_type": 1,
+                #         "flag1": 0,
+                #         "flag2": 0,
+                #         "active_time1": 0,
+                #         "active_time2": 0,
+                #         "application_from_direction1": 10,
+                #         "application_from_direction2": 0,
+                #         "app_id1": None,
+                #         "app_source_id1": None,
+                #         "app_des_id1": None,
+                #         "app_id2": None,
+                #         "app_source_id2": None,
+                #         "app_des_id2": None,
+                #         "app_1": None,
+                #         "app_2": None
+                #     }
+
+                    # 转成 SocketView 再 append，避免类型报错
+                    # SocketView.update_links.append(SocketView._dict_to_socketview(extra_dict))
+                    # print(extra_dict)
+
+                    # 构造 app_1_info
+                    # new_app_id = str(receive_link_state_obj["app_id"])
+                    # new_app_source_id = str(receive_link_state_obj["app_source_id"])
+                    # new_app_des_id = str(receive_link_state_obj["app_des_id"])
+                    # app_1_info = {
+                    #     "app_id": new_app_id + new_app_source_id,
+                    #     "app_source_id": new_app_source_id,
+                    #     "app_des_id": new_app_des_id
+                    # }
+                    #
+                    # # 获取刚刚 append 的最后一个 SocketView 对象
+                    # last_link = SocketView.update_links[-1]
+                    # if last_link.app_1:
+                    #     if not any(
+                    #             app["app_id"] == app_1_info["app_id"]
+                    #             and app["app_source_id"] == app_1_info["app_source_id"]
+                    #             and app["app_des_id"] == app_1_info["app_des_id"]
+                    #             for app in last_link.app_1
+                    #     ):
+                    #         last_link.app_1.append(app_1_info)
+                    # else:
+                    #     last_link.app_1 = [app_1_info]
+
         SocketView.json_list = []
 
         for idx, update_link in enumerate(SocketView.update_links):
@@ -4791,38 +5410,6 @@ class SocketView(View):
             }
             applications.append(record_dict1)
 
-        if int(SocketView.now_time) == 30000000000:  #原来是1260lyk
-            SocketView.carStart = 1
-        if SocketView.carStart == 1:
-            if SocketView.cari % 2 == 1:
-                lat1 = 42
-                lon1 = 96
-                SocketView.car_info1 = {
-                    "satellite_id": "satellite_" + "4",
-                    "lat": str(lat1),
-                    "lon": str(lon1),
-                    "alt": "500",
-                    "type": "airplane",
-                    "name": "一级节点1",
-                    "error_interface": None,
-                    "print_link": None,
-                }
-                SocketView.cari = SocketView.cari + 1
-            if SocketView.cari % 2 == 0:
-                lat1 = 43
-                lon1 = 97
-                SocketView.car_info1 = {
-                    "satellite_id": "satellite_" + "4",
-                    "lat": str(lat1),
-                    "lon": str(lon1),
-                    "alt": "0",
-                    "type": "airplane",
-                    "name": "一级节点1",
-                    "error_interface": None,
-                    "print_link": None,
-                }
-                SocketView.cari = SocketView.cari + 1
-
         for normal_item in SocketView.normal_node:
             normal_satellite_id = normal_item["satellite_id"]  # 获取 normal_node 中项的 satellite_id
             normal_property = normal_item["type"]  # 获取 normal_node 中的第五个属性（索引从 0 开始，所以第五个属性是索引 4）
@@ -4841,7 +5428,7 @@ class SocketView(View):
         SocketView.update_satellite_print_link(self, SocketView.update_links, SocketView.satellites)
         sendtofrontbysocket(self, int(SocketView.now_time) - int(SocketView.interval), SocketView.satellites,
                             SocketView.json_list, applications)
-        SocketView.link_state = []
+        SocketView.receive_link_state = []
 
     def update_satellite_print_link(self, update_links, satellites):
         # 遍历update_links中的每个update_link对象
@@ -4862,9 +5449,9 @@ class SocketView(View):
             if name1 and name2:
                 # 根据link_type设置link名称
                 if update_link.link_type == "1":
-                    link = "微波网络"
+                    link = "无线链路"
                 elif update_link.link_type == "2":
-                    link = "地面光纤"
+                    link = "有线链路"
                 else:
                     link = "其他"
 
@@ -4970,7 +5557,7 @@ class SocketView(View):
             try:
                 if SocketView.stop_receive_message == 1:
                     break
-                response_data = SocketView.client_socket.recv(1000000)  # 假设响应不超过 1024 字节
+                response_data = SocketView.client_socket.recv(10000000)  # 假设响应不超过 1024 字节
                 SocketView.exata_response = binascii.hexlify(response_data).decode('utf-8')  # 转换为16进制字符串
                 # 打印 response_data (字节串)，以十六进制表示
                 while SocketView.exata_response:
@@ -5009,19 +5596,15 @@ class SocketView(View):
     @csrf_exempt
     def post(self, request):
         global absolute_path
+        global selected_scene_name
         content_type = request.META.get('CONTENT_TYPE')
         if content_type == 'application/json':
             data = json.loads(request.body)
             if 'connect' in data:
-
+                SocketView.startSign = False
                 # 在仿真开始时，把消息队列设置为空
                 # sendtofrontbysocket(request, "web socket 已经建立", "", "")
-                SocketView.carStart = 0
-                SocketView.cari = 0
-                SocketView.car_info1 = []
-                SocketView.car_info2 = []
-                SocketView.car_info3 = []
-                SocketView.car_info4 = []
+
                 SocketView.initial_k = 1
                 SocketView.i = 0
                 SocketView.ddk1 = 1
@@ -5042,28 +5625,26 @@ class SocketView(View):
                 exata = ExataSimulator(
 
                     working_directory=absolute_path,
-                    executable_path=r"D:\Program Files\Scalable\exata\7.3.0.0\bin\exata.exe",
-                    config_file="cuixinbin.config",
+                    # executable_path=r"D:\Scalable\exata7.3.0.0\exata\7.3.0.0\bin\exata.exe",
+                    executable_path=r"D:\exata\exata\exata\7.3.0.0\bin\exata.exe",#xkz exata地址
+                    config_file=f"{selected_scene_name}.config",
+                    # config_file="fina1.config"
                 )
                 exata.stop_simulation()
                 #
                 exata.run_simulation()
-                # time.sleep(3)
-                x = self.connect_to_server()
+                time.sleep(3)
+                self.connect_to_server()
                 print(f"连接中")
                 SocketView.simulation_running = True
                 SocketView.message_indexStep = 0  # 当前发送的消息索引
                 SocketView.message_indexContinue = 0  # 当前发送的消息索引
                 SocketView.send_start_message(self)
                 SocketView.send_next_message(self)
-                return JsonResponse(x)
-            # elif 'sendsimulationmessage' in data:
-            #     SocketView.now_time = 0
-            #     SocketView.continue_send = True
-            #     SocketView.exataisidle = False
-            #     SocketView.gene_read_send_thread = threading.Thread(target=self.gene_read_send_message,
-            #                                                         daemon=True).start()  # 不要加括号
-            #     return JsonResponse({"status": "所有消息已发送完毕"})
+                if SocketView.startSign:
+                    return JsonResponse({"status": "初始化成功了"})
+                else:
+                    return JsonResponse({"status": "初始化失败了"})
 
             elif 'sendsimulationmessage' in data:
                 current_path = absolute_path  # 捕获当前路径值
@@ -5081,6 +5662,8 @@ class SocketView(View):
             elif 'pausesimulation' in data:
 
                 y = self.pause_simulation()
+                time.sleep(4)
+                y = self.pause_simulation()
                 return JsonResponse(y)
             elif 'continuesimulation' in data:
 
@@ -5091,7 +5674,7 @@ class SocketView(View):
                 y = self.step_simulation()
                 return JsonResponse(y)
             elif 'stopsimulation' in data:
-                subprocess.Popen(['daphne', '-b', '0.0.0.0', '-p', '8001', 'mytest.asgi:application'])
+                # subprocess.Popen(['daphne', '-b', '0.0.0.0', '-p', '8001', 'mytest.asgi:application'])
                 y = self.stop_simulation()
 
                 return JsonResponse(y)
@@ -5106,49 +5689,65 @@ class SocketView(View):
     @csrf_exempt
     def stop_simulation(self):
 
-        # self.exata.stop_simulation()
-
-        SocketView.stop_receive_message = 1
-        SocketView.stop_handle_message = 1
-        SocketView.stop_send_message = 1
-
-        SocketView.exata_response = ""
-        SocketView.handleMessage_queue = []
-        SocketView.data = ""
+        SocketView.startSign = False
+        # 在仿真开始时，把消息队列设置为空
+        # sendtofrontbysocket(request, "web socket 已经建立", "", "")
+        SocketView.initial_k = 1
+        SocketView.i = 0
+        SocketView.ddk1 = 1
+        SocketView.ddk2 = 1
         SocketView.send_queue = []
         SocketView.receive_queue = []
-        SocketView.simulation_running = False
-        SocketView.message_indexStep = 0
-        SocketView.message_indexContinue = 0
-        SocketView.over_controlmessage = ""
-        SocketView.controlmessage = ""
-        SocketView.isPaused = False
-        SocketView.isStep = False
-        SocketView.hasbeenstep = False
-        SocketView.isPaused_lock = Lock()
-        SocketView.isStep_lock = Lock()
-        SocketView.now_time = 0
-        SocketView.continue_send = True
-        SocketView.frontshowisover = True
-        SocketView.exataisidle = False
-        SocketView.satellites = []
+        SocketView.handleMessage_queue = []
         SocketView.sat_arr = []
         SocketView.start_time = []
         SocketView.print_state = 0
-        SocketView.links = []
-        SocketView.x = 0
-        # pid = get_daphne_pid_windows()
-        #
-        # if pid:
-        #     # 如果有运行中的进程，先停止
-        #     from runDaphne import stop_daphne_windows
-        #     stop_daphne_windows(pid)
-        #     from runDaphne import start_daphne
-        #     start_daphne()
+        SocketView.stop_receive_message = 0
+        SocketView.stop_send_message = 0
+        SocketView.stop_handle_message = 0
+        SocketView.ip_list = []
+        SocketView.link_x = 1
+        sat_init()  # 初始化各个卫星
+        print(f"chushihua场景文件夹绝对路径: {absolute_path}")
+        exata = ExataSimulator(
 
-        # 启动 Daphne 服务
+            working_directory=absolute_path,
+            executable_path=r"D:\exata\exata\exata\7.3.0.0\bin\exata.exe",
+            config_file=f"{selected_scene_name}.config",
+            # config_file="fina1.config"
+        )
+        exata.stop_simulation()
+        script_path = "restart_daphne.bat"
 
-        return {"status": "停止仿真"}  # 返回状态
+        if not os.path.exists(script_path):
+            print(f"错误：重启脚本 '{script_path}' 未找到。无法重启服务。")
+            # 即使重启失败，仿真停止的指令也已完成
+            return {"status": "停止仿真但重启失败"}
+
+        try:
+            # 使用 Popen 启动一个独立的进程来执行重启脚本。
+            # 这一步和之前一样。
+            print(f"正在启动外部重启脚本: {script_path}")
+            subprocess.Popen([script_path], shell=True)
+
+            # 【关键步骤】
+            # 在发出重启命令后，当前进程的使命已经完成。
+            # 我们必须在这里让它干净地退出，以便 .bat 脚本可以顺利地杀死它。
+            print("重启命令已发出，当前服务进程将立即退出。")
+
+            # 使用 sys.exit() 来请求一个干净的退出。
+            # .bat 中的 taskkill 会确保它被强制终止。
+            sys.exit(0)
+
+        except Exception as e:
+            print(f"错误：执行重启脚本时发生异常: {e}")
+            # 即使重启失败，仿真停止的指令也已完成
+            return {"status": "停止仿真但重启失败"}
+
+        # 这之后的代码理论上不会被执行，因为 sys.exit() 了
+        # 但为了函数完整性，可以保留一个返回值
+        return {"status": "停止仿真，重启中..."}
+
 
     def gene_read_send_message(self, current_path):
         # 因为原来文件来自于配置前端，其中保存一些固定配置，所以先读一些参数
@@ -5182,11 +5781,11 @@ class SocketView(View):
                 cal_sat_pos(SocketView.now_time)
                 calculator.append_orientation_to_file(SocketView.now_time,
                                                       SocketView.now_time + int(SocketView.interval))
-                SocketView.read_node_file(self) #每次都会读取节点的信息
+                SocketView.read_node_file(self)  #每次都会读取节点的信息
                 self.read_message_file(current_path)  # 读取消息文件并初始化队列
                 response = self.send_next_message()
 
-    def read_initial_config(self,initial_file):
+    def read_initial_config(self, initial_file):
         global absolute_path
         try:
             with open(initial_file, 'r') as file:
@@ -5202,7 +5801,7 @@ class SocketView(View):
                     command = command_parts[0]
                     if command == 'INTERVAL':
                         SocketView.interval = command_parts[1]
-                        print("intinalintinalintinalintinalintinal"+SocketView.interval)
+                        # print("intinalintinalintinalintinalintinal" + SocketView.interval)
                     if command == 'FINAL':
                         SocketView.final = command_parts[1]
 
@@ -5312,9 +5911,9 @@ class SocketView(View):
         except Exception as e:
             print(f"创建文件失败: {e}")
 
-    def read_message_file(self,current_path):
+    def read_message_file(self, current_path):
         """读取消息文件并将符合条件的消息加入队列"""
-        SocketView.config_file=current_path / "config_no_move.txt"
+        SocketView.config_file = current_path / "config_no_move.txt"
         if os.path.exists(SocketView.config_file):
             try:
 
@@ -5365,7 +5964,7 @@ class SocketView(View):
                                 elif command_parts[i] == 'ALT':
                                     altitude = command_parts[i + 1]
                                     hex_altitude = SocketView.float_to_hex(self, altitude)
-                                    print(f"hex_altitude: {hex_altitude}")
+                                    # print(f"hex_altitude: {hex_altitude}")
                                     i += 2
                                 elif command_parts[i] == 'VELLON':
                                     vellon = command_parts[i + 1]
@@ -5392,17 +5991,19 @@ class SocketView(View):
                             # 执行相应的操作
                             final_command = hex_header + hex_entity_id + hex_latitude + hex_longitude + hex_altitude + hex_damage_state + hex_time + hex_type
                             # print(f"final cp is :{final_command}")
-                            SocketView.satellites.append({
-                                "satellite_id": "satellite_" + command_parts[1],
-                                "lat": command_parts[4],
-                                "lon": command_parts[6],
-                                "alt": command_parts[8],
-                                "type": None,
-                                "name": None,
-                                "error_interface": None,
-                                "print_link": None,
-                            })
+
                             if SocketView.initial_k == 1:
+                                # SocketView.satellites.append({
+                                #     "satellite_id": "satellite_" + command_parts[1],
+                                #     "lat": command_parts[4],
+                                #     "lon": command_parts[6],
+                                #     "alt": command_parts[8],
+                                #     "type": None,
+                                #     "name": None,
+                                #     "error_interface": None,
+                                #     "print_link": None,
+                                # })
+                                # print('SocketView.send_queue.append(final_command)')
                                 SocketView.send_queue.append(final_command)
                     SocketView.initial_k = 0
                 with open(SocketView.config_file, 'r') as file:
@@ -5449,7 +6050,7 @@ class SocketView(View):
                                 elif command_parts[i] == 'ALT':
                                     altitude = command_parts[i + 1]
                                     hex_altitude = SocketView.float_to_hex(self, altitude)
-                                    print(f"hex_altitude: {hex_altitude}")
+                                    # print(f"hex_altitude: {hex_altitude}")
                                     i += 2
                                 elif command_parts[i] == 'VELLON':
                                     vellon = command_parts[i + 1]
@@ -5590,6 +6191,7 @@ class SocketView(View):
 
             except Exception as e:
                 print(f"读取消息文件失败: {e}")
+
     def send_start_message(self):
         SocketView.send_queue.append(SocketView.initialmessage)
         SocketView.send_queue.append(SocketView.pausemessage)
@@ -5618,6 +6220,44 @@ class SocketView(View):
         SocketView.send_queue.append(SocketView.controlmessage)
         SocketView.send_queue.append(SocketView.over_controlmessage)
 
+
+    def rename_stat_file_to_current_time(folder_path='.'):
+        """
+        在指定文件夹下查找 exata.stat 文件，并将其重命名为当前时间格式（YYYYMMDDHHMM.stat）。
+
+        参数:
+        folder_path (str): 要搜索的目标文件夹路径。默认为当前脚本所在的目录。
+        """
+        original_filename = 'exata.stat'
+        # 使用 os.path.join 来正确地组合路径和文件名
+        full_original_path = os.path.join(folder_path, original_filename)
+
+        # 1. 检查文件是否存在
+        if os.path.exists(full_original_path):
+            # 2. 获取当前系统时间
+            now = datetime.now()  # <-- 修改在这里：现在调用更简洁
+
+            # 3. 按照 "年(4位)月(2位)日(2位)小时(2位)分钟(2位)" 的格式创建新文件名
+            #    例如: 202508160247.stat
+            new_filename_base = now.strftime("%Y%m%d%H%M")
+
+            # 保留原始文件的扩展名 .stat
+            file_extension = os.path.splitext(original_filename)[1]
+            new_filename = f"{new_filename_base}{file_extension}"
+
+            # 组合成完整的新文件路径
+            full_new_path = os.path.join(folder_path, new_filename)
+
+            # 4. 执行重命名操作
+            try:
+                os.rename(full_original_path, full_new_path)
+                print(f"成功：已将文件 '{full_original_path}' 重命名为 '{full_new_path}'")
+            except OSError as e:
+                print(f"错误：重命名文件时发生错误。 {e}")
+        else:
+            # 5. 如果文件不存在，则打印提示信息
+            print(f"未找到文件：在文件夹 '{os.path.abspath(folder_path)}' 中未找到 '{original_filename}'")
+
     def send_next_message(self):
         """发送队列中的下一条消息"""
         while True:
@@ -5625,16 +6265,17 @@ class SocketView(View):
                 # 用于开始暂停过的仿真
                 SocketView.simulation_running = True
                 message = SocketView.send_queue[0]
-                print(f"发送消息队列：{SocketView.send_queue}")
+                # print(f"发送消息队列：{SocketView.send_queue}")发送给exata的
                 SocketView.send_queue.remove(SocketView.send_queue[0])
                 encoded_message = bytes.fromhex(message)
+                # print(f"已发送消息: {message}")
                 if message.startswith('06'):
                     time.sleep(0.5)
-                    print("nihao")
+                    # print("nihao")
                 try:
                     if message == SocketView.over_controlmessage:
                         time.sleep(3)
-                        SocketView.over_controlmessage = ""
+
                     if message == SocketView.controlmessage:
                         time.sleep(3)
                         SocketView.controlmessage = ""
@@ -5642,13 +6283,17 @@ class SocketView(View):
                     SocketView.client_socket.sendall(encoded_message)
                     # time.sleep(0.5)
                     SocketView.message_indexContinue += 1
-                    print(f"已发送消息: {message}")
+                    if message == SocketView.over_controlmessage:
+                        time.sleep(3)
+                        SocketView.rename_stat_file_to_current_time(absolute_path)
+                        SocketView.over_controlmessage = ""
+                    if message == '03 00 00 00 00 00 00 08':
+                        SocketView.startSign = True
                     # return {"status": "消息发送成功", "message": message}
                 except socket.error as e:
                     return {"status": f"发送失败: {e}"}
             else:
                 break
-
 
     @csrf_exempt
     def pause_simulation(self):
@@ -5666,7 +6311,8 @@ class SocketView(View):
         """定时发送消息，间隔 3 秒发送下一条消息"""
         if not SocketView.simulation_running:
             # SocketView.send_queue.insert(0, SocketView.pausemessage)
-            SocketView.simulation_running = True  # 停止仿真
+            print(f"if not SocketView.simulation_running:")
+            SocketView.simulation_running = True  # 继续仿真
             SocketView.set_isPaused(False)
             SocketView.isStep = False
             return {"status": "仿真已继续开始执行"}
@@ -5685,9 +6331,3 @@ class SocketView(View):
         else:
             return {"status": "请不要重复开始，但你不应该看见这句话"}
 
-    @classmethod
-    def close_connection(cls):
-        if cls.client_socket:
-            cls.client_socket.close()
-            cls.client_socket = None
-            print("关闭连接")
