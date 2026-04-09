@@ -2159,50 +2159,6 @@ def edit_link_list(request, link_id):
             status=500
         )
 
-
-'''
-def edit_link_list(request, link_id):
-    """
-    仅修改链路带宽，其余字段保持不变。
-    前端传的数据格式：{"bandwidth": 10}  # 单位：Mbps
-    """
-    try:
-        # 解析请求 JSON
-        data = json.loads(request.body)
-        new_bandwidth = data.get("bandwidth")
-        if new_bandwidth is None:
-            return JsonResponse({'status': 'error', 'message': '缺少带宽参数'}, status=400)
-
-        # 转换为 bps
-        new_bandwidth_bps = float(new_bandwidth) * 1_000_000
-
-        with transaction.atomic():
-            # 获取链路
-            link = Link.objects.select_for_update().get(id=link_id)
-            link.bandwidth = new_bandwidth_bps
-            link.save()
-
-        return JsonResponse({'status': 'success', 'message': f'带宽已更新为 {new_bandwidth_bps} bps'})
-
-    except Link.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '链路不存在'}, status=404)
-    except json.JSONDecodeError:
-        return JsonResponse({'status': 'error', 'message': '无效的JSON格式'}, status=400)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({'status': 'error', 'message': f'服务器错误: {str(e)}'}, status=500)
-'''
-
-
-def rearrange_interfaceIndexes(node):
-    interfaces = Interface.objects.filter(node=node).order_by('interfaceIndex')
-    for index, interface in enumerate(interfaces):
-        if interface.interfaceIndex != index:
-            interface.interfaceIndex = index
-            interface.save()
-
-
 @csrf_exempt
 @require_http_methods(["DELETE"])
 def delete_link_list(request, link_id):
@@ -2237,21 +2193,6 @@ def delete_link_list(request, link_id):
         return JsonResponse({'status': 'error', 'message': '链路不存在'}, status=404)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': f'删除失败: {str(e)}'}, status=500)
-
-
-# 优化后的索引重排函数
-def rearrange_interfaceIndexes(node):
-    """批量更新接口索引（性能优化版）"""
-    interfaces = list(node.interfaces.order_by('id'))
-    update_list = []
-
-    for index, interface in enumerate(interfaces):
-        if interface.interfaceIndex != index:
-            interface.interfaceIndex = index
-            update_list.append(interface)
-
-    if update_list:
-        Interface.objects.bulk_update(update_list, ['interfaceIndex'])
 
 
 '''
@@ -3256,24 +3197,10 @@ def generate_node_file(request):
             return HttpResponse('Error: Missing sceneId parameter', status=400)
 
         # 获取指定场景的所有普通节点
-        nodes = Node.objects.filter(sceneId=scene_id, nodeType='normalNode')
+        nodes = Node.objects.filter(sceneId=scene_id, nodeType='normalNode').order_by('id')
 
         # 准备 node.txt 文件内容
-        node_content = []
-        for node in nodes:
-            # 构建节点数据行
-            line = (
-                f"{node.id} "
-                f"{node.startTime.year} {node.startTime.month} {node.startTime.day} "
-                f"{node.startTime.hour} {node.startTime.minute} {node.startTime.second} "
-                f"{node.startTime.microsecond // 1000} "
-                f"{node.lat} "
-                f"{node.lon} "
-                f"{node.alt} "
-                f"{node.nodeImage} "
-                f"{node.nodeName}\n"
-            )
-            node_content.append(line)
+        node_content = _build_node_txt_lines(nodes)
 
         # 将内容写入文件或返回给用户
         response = HttpResponse(content_type='text/plain')
@@ -3677,18 +3604,7 @@ def download_all_files(request):
     response.write("\n")
 
     # 生成并保存 node.txt 文件
-    node_content = []
-    for node in normal_nodes:
-        line = (
-                f"{node_id_map[node.id]} "
-                + "0 " +
-                f"{node.lat} "
-                f"{node.lon} "
-                f"{node.alt} "
-                f"{node.nodeImage} "
-                f"{node.nodeName}\n"
-        )
-        node_content.append(line)
+    node_content = _build_node_txt_lines(normal_nodes.order_by('id'), node_id_map=node_id_map)
 
     node_path = os.path.join(scene_folder, "node.txt")
     with open(node_path, 'w', encoding='utf-8') as f:
@@ -3779,25 +3695,88 @@ def generate_scene_app_content(scene,node_id_map):
     return content
 
 
+def _parse_node_point_time(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _build_node_timeline_rows(node, exported_node_id):
+    rows = []
+    base_lat = float(node.lat) if node.lat is not None else 0.0
+    base_lon = float(node.lon) if node.lon is not None else 0.0
+    base_alt = float(node.alt) if node.alt is not None else 0.0
+    rows.append((int(0), base_lat, base_lon, base_alt))
+
+    start_time = _parse_node_point_time(node.startTime)
+    via_points = node.viaPoints if isinstance(node.viaPoints, list) else []
+    for point in via_points:
+        if not isinstance(point, dict):
+            continue
+        point_time = _parse_node_point_time(point.get('time'))
+        if point_time is None or start_time is None:
+            continue
+        if start_time.tzinfo is not None and point_time.tzinfo is None:
+            point_time = point_time.replace(tzinfo=start_time.tzinfo)
+        elif start_time.tzinfo is None and point_time.tzinfo is not None:
+            point_time = point_time.replace(tzinfo=None)
+        seconds = int((point_time - start_time).total_seconds())
+        if seconds < 0:
+            continue
+        rows.append(
+            (
+                seconds,
+                float(point.get('lat', 0.0) or 0.0),
+                float(point.get('lon', 0.0) or 0.0),
+                float(point.get('alt', 0.0) or 0.0),
+            )
+        )
+
+    rows.sort(key=lambda item: item[0])
+    return [
+        {
+            'node_id': exported_node_id,
+            'time_s': time_s,
+            'lat': lat,
+            'lon': lon,
+            'alt': alt,
+            'node_image': node.nodeImage,
+            'node_name': node.nodeName,
+        }
+        for time_s, lat, lon, alt in rows
+    ]
+
+
+def _build_node_txt_lines(nodes, node_id_map=None):
+    lines = []
+    for node in nodes:
+        exported_node_id = node_id_map[node.id] if node_id_map else node.id
+        for row in _build_node_timeline_rows(node, exported_node_id):
+            lines.append(
+                f"{row['node_id']} {row['time_s']} {row['lat']} {row['lon']} {row['alt']} {row['node_image']} {row['node_name']}\n"
+            )
+    return lines
+
+
 def generate_scene_nodes_content(scene,node_id_map):
     nodes = Node.objects.filter(Q(sceneId=scene)).order_by('id')
     content = ""
     for node in nodes:
-        node_line = f"{node_id_map[node.id]} "
-        if node.startTime and scene.startTime:
-            # time_offset = (node.startTime - scene.startTime).total_seconds()
-            time_offset = 0
-        else:
-            time_offset = 0
-        node_line += f"{int(time_offset)} "
-
         if node.nodeType == 'normalNode':
-            node_line += f"({node.lat if node.lat is not None else 0} {node.lon if node.lon is not None else 0} {node.alt if node.alt is not None else 0})"
+            for row in _build_node_timeline_rows(node, node_id_map[node.id]):
+                content += f"{row['node_id']} {row['time_s']} ({row['lat']} {row['lon']} {row['alt']}) 0 0 0\n"
         else:
-            node_line += "(0 0 0)"
-
-        node_line += " 0 0 0\n"
-        content += node_line
+            content += f"{node_id_map[node.id]} 0 (0 0 0) 0 0 0\n"
     return content
 
 

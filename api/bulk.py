@@ -5,6 +5,7 @@
 import os
 import re
 import json
+from datetime import timedelta
 from django.conf import settings
 from django.db import transaction
 from django.test import RequestFactory
@@ -70,6 +71,52 @@ def _get_special_type(node_id: int, special_type_map: dict) -> str | None:
             return stype
     return None
 
+
+def _parse_nodes_file(nodes_path: str, scene_start_time):
+    grouped_nodes = {}
+    with open(nodes_path, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith('#'):
+                continue
+
+            first_tok = line.split()[0]
+            node_id = int(first_tok)
+            time_s = int(line.split()[1])
+            m = _COORD_RE.search(line)
+            if not m:
+                raise ValueError(f'无法在行中找到坐标: {line}')
+            parts = [p for p in re.split(r'[,\s]+', m.group(1)) if p]
+            if len(parts) < 3:
+                raise ValueError(f'坐标不足3个值: {m.group(1)}')
+            lat, lon, alt = map(float, parts[:3])
+
+            entry = grouped_nodes.setdefault(
+                node_id,
+                {
+                    'lat': lat,
+                    'lon': lon,
+                    'alt': alt,
+                    'viaPoints': [],
+                }
+            )
+
+            if time_s == 0:
+                entry['lat'] = lat
+                entry['lon'] = lon
+                entry['alt'] = alt
+            else:
+                entry['viaPoints'].append(
+                    {
+                        'lon': lon,
+                        'lat': lat,
+                        'alt': alt,
+                        'time': (scene_start_time + timedelta(seconds=time_s)).isoformat(),
+                    }
+                )
+
+    return grouped_nodes
+
 def import_nodes_from_file(scene_id: int):
     """
     从 {MEDIA_ROOT}/scene_files/{sceneName}/ 读取：
@@ -93,54 +140,37 @@ def import_nodes_from_file(scene_id: int):
     total = ok = fail = 0
     errors = []
 
-    with open(nodes_path, 'r', encoding='utf-8') as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith('#'):
-                continue
-            total += 1
-            try:
-                # 取第一个字段作为 node_id
-                first_tok = line.split()[0]
-                node_id = int(first_tok)
+    parsed_nodes = _parse_nodes_file(nodes_path, scene.startTime)
+    for node_id, node_info in parsed_nodes.items():
+        total += 1
+        try:
+            payload = {
+                'sceneId': scene_id,
+                'nodeName': str(node_id),
+                'nodeImage': 'transmitterUnit',
+                'nodeType': 'normalNode',
+                'lat': node_info['lat'],
+                'lon': node_info['lon'],
+                'alt': node_info['alt'],
+                'startTime': scene.startTime.isoformat(),
+                'specialType': _get_special_type(node_id, special_type_map),
+                'viaPoints': node_info['viaPoints'],
+            }
 
-                # 括号内为坐标，允许中间有逗号
-                m = _COORD_RE.search(line)
-                if not m:
-                    raise ValueError(f'无法在行中找到坐标: {line}')
-                coord_str = m.group(1)  # "lat lon alt" 可能含逗号
-                parts = [p for p in re.split(r'[,\s]+', coord_str) if p]
-                if len(parts) < 3:
-                    raise ValueError(f'坐标不足3个值: {coord_str}')
-                lat, lon, alt = map(float, parts[:3])
-
-                payload = {
-                    'sceneId': scene_id,
-                    'nodeName': str(node_id),           # 也可改成 f'normalNode_{node_id}'
-                    'nodeImage': 'transmitterUnit',
-                    'nodeType': 'normalNode',
-                    'lat': lat,
-                    'lon': lon,
-                    'alt': alt,
-                    # 传 ISO8601 字符串，Django 会在 full_clean 时解析
-                    'startTime': scene.startTime.isoformat(),
-                    'specialType': _get_special_type(node_id, special_type_map),
-                }
-
-                req = factory.post(
-                    '/api/addNodeList/',
-                    data=json.dumps(payload),
-                    content_type='application/json'
-                )
-                resp = add_node_list(req)
-                if getattr(resp, 'status_code', 500) == 200:
-                    ok += 1
-                else:
-                    fail += 1
-                    errors.append((node_id, resp.content.decode('utf-8', 'ignore')))
-            except Exception as e:
+            req = factory.post(
+                '/api/addNodeList/',
+                data=json.dumps(payload),
+                content_type='application/json'
+            )
+            resp = add_node_list(req)
+            if getattr(resp, 'status_code', 500) == 200:
+                ok += 1
+            else:
                 fail += 1
-                errors.append((line, str(e)))
+                errors.append((node_id, resp.content.decode('utf-8', 'ignore')))
+        except Exception as e:
+            fail += 1
+            errors.append((node_id, str(e)))
 
     print(f'导入完成: 总计 {total}, 成功 {ok}, 失败 {fail}')
     for item, err in errors:
@@ -484,41 +514,32 @@ def import_scene_from_files(scene_id: int):
     total = ok = fail = 0
     errors = []
 
-    with open(nodes_path, 'r', encoding='utf-8') as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith('#'):
-                continue
-            total += 1
-            try:
-                node_id = int(line.split()[0])  # 文件里的序号
-                m = _COORD_RE.search(line)
-                if not m:
-                    raise ValueError(f'无法在行中找到坐标: {line}')
-                parts = [p for p in re.split(r'[,\s]+', m.group(1)) if p]
-                lat, lon, alt = map(float, parts[:3])
-
-                payload = {
-                    'sceneId': scene_id,
-                    'nodeName': str(node_id),
-                    'nodeImage': 'transmitterUnit',
-                    'nodeType': 'normalNode',
-                    'lat': lat,
-                    'lon': lon,
-                    'alt': alt,
-                    'startTime': scene.startTime.isoformat(),
-                    'specialType': _get_special_type(node_id, special_type_map),
-                }
-                req = factory.post('/api/addNodeList/', data=json.dumps(payload), content_type='application/json')
-                resp = add_node_list(req)
-                if getattr(resp, 'status_code', 500) == 200:
-                    ok += 1
-                else:
-                    fail += 1
-                    errors.append((node_id, resp.content.decode('utf-8', 'ignore')))
-            except Exception as e:
+    parsed_nodes = _parse_nodes_file(nodes_path, scene.startTime)
+    for node_id, node_info in parsed_nodes.items():
+        total += 1
+        try:
+            payload = {
+                'sceneId': scene_id,
+                'nodeName': str(node_id),
+                'nodeImage': 'transmitterUnit',
+                'nodeType': 'normalNode',
+                'lat': node_info['lat'],
+                'lon': node_info['lon'],
+                'alt': node_info['alt'],
+                'startTime': scene.startTime.isoformat(),
+                'specialType': _get_special_type(node_id, special_type_map),
+                'viaPoints': node_info['viaPoints'],
+            }
+            req = factory.post('/api/addNodeList/', data=json.dumps(payload), content_type='application/json')
+            resp = add_node_list(req)
+            if getattr(resp, 'status_code', 500) == 200:
+                ok += 1
+            else:
                 fail += 1
-                errors.append((line, str(e)))
+                errors.append((node_id, resp.content.decode('utf-8', 'ignore')))
+        except Exception as e:
+            fail += 1
+            errors.append((node_id, str(e)))
 
     print(f'节点导入完成: 总计 {total}, 成功 {ok}, 失败 {fail}')
     for item, err in errors:
