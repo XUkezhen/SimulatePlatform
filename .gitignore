@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# IDE
+.idea/
+
+# Database
+db.sqlite3
+
+# Logs
+debug_log.txt
+
+# Temp files
+tmp/
+*.log
+
+# Backup
+api - 副本/
+
+# Misc
+packages/
+pk/
+scene_files/
+api/messages.txt
+api/import math.py

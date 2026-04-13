@@ -11,7 +11,7 @@ from django.core.exceptions import ValidationError
 #3.11 下午 views 添加get 函数
 #3.13 凌晨 修改完映射表
 #3.15xiu该链路表
-#4.30 完成.app的调试。未完成。postman出错
+#4.30 完成.app的调试。未完成。postman出错yin
 #5.25上午修改，add_link函数。
 #下午修改生成文件，改动的是单独的那个生成函数,模板文件和生成函数都变了,download也变了。
 # 修改link函数。
@@ -82,6 +82,14 @@ class Node(models.Model):
         default=None,
         verbose_name="特殊节点类型"
     )
+    epochTime = models.DateTimeField(null=True, blank=True, verbose_name="历元时间")
+    orbitStepSize = models.FloatField(null=True, blank=True, verbose_name="轨道计算步长")
+    orbitStepCount = models.IntegerField(null=True, blank=True, verbose_name="轨道计算步数")
+    orbitInclination = models.FloatField(null=True, blank=True, verbose_name="轨道倾角")
+    orbitArgPerigee = models.FloatField(null=True, blank=True, verbose_name="近地点幅角")
+    orbitRaan = models.FloatField(null=True, blank=True, verbose_name="升交点赤经")
+    orbitMeanAnomaly = models.FloatField(null=True, blank=True, verbose_name="平近点角")
+    orbitAltitude = models.FloatField(null=True, blank=True, verbose_name="轨道高度")
     # satellite 特有字段
     eccentricity = models.FloatField(null=True, blank=True)  # 偏心率
     argPerigee = models.FloatField(null=True, blank=True)     # 近地点幅角
@@ -111,9 +119,25 @@ class Node(models.Model):
                 raise ValidationError("Satellite nodes require all orbital elements and startTime.")
 
         elif self.nodeType == 'normalNode':
-            required_fields = [self.lon, self.lat, self.alt, self.startTime]
-            if any(field is None for field in required_fields):
-                raise ValidationError("Normal nodes require lon, lat, alt, and startTime.")
+            is_leo = self.specialType in {'LEO', '近地卫星'}
+            if is_leo:
+                required_fields = [
+                    self.startTime,
+                    self.epochTime,
+                    self.orbitStepSize,
+                    self.orbitStepCount,
+                    self.orbitInclination,
+                    self.orbitArgPerigee,
+                    self.orbitRaan,
+                    self.orbitMeanAnomaly,
+                    self.orbitAltitude,
+                ]
+                if any(field is None for field in required_fields):
+                    raise ValidationError("LEO normal nodes require startTime, epochTime, step size/count and orbit parameters.")
+            else:
+                required_fields = [self.lon, self.lat, self.alt, self.startTime]
+                if any(field is None for field in required_fields):
+                    raise ValidationError("Normal nodes require lon, lat, alt, and startTime.")
 
             if self.viaPoints:
                 try:
@@ -159,6 +183,7 @@ class Configuration(models.Model):
     cbrEndTime = models.DateTimeField(null=True, blank=True, verbose_name='CBR结束时间')
     cbrSendInterval = models.IntegerField(null=True, blank=True, verbose_name='CBR发送间隔（ms）')
     cbrPacketSize = models.IntegerField(null=True, blank=True, verbose_name='CBR包大小（Bytes）')
+    cbrPrecedence = models.IntegerField(null=True, blank=True, verbose_name='CBR优先级')
     TransferType = models.CharField(null = True,blank= True,default= 'ID',max_length= 2)
     # ========== FTP 配置 ==========
     ftpStartTime = models.DateTimeField(null=True, blank=True, verbose_name='FTP开始时间')
@@ -386,99 +411,4 @@ class NodeMapping(models.Model):
     sceneId = models.ForeignKey('Scene', on_delete=models.CASCADE, related_name='mappings')
     interface = models.ForeignKey(Interface, on_delete=models.CASCADE, related_name='mappings')
     mappingIp = models.GenericIPAddressField()
-
-class PhysicalLayer(models.Model):
-    RADIO_TYPES = [
-        ('Abstract', 'Abstract'),
-        ('802.11b', '802.11b'),
-        # 其他无线电类型
-    ]
-    ANTENNA_TYPES = [
-        ('Omnidirectional', 'Omnidirectional'),
-        ('Patterned', 'Patterned'),
-    ]
-    PATTERN_TYPES = [
-        ('Ascii2d', 'Ascii2d'),
-        # 其他图案类型
-    ]
-
-    interface = models.OneToOneField(Interface, on_delete=models.CASCADE, related_name='physical_layer')
-    radioType = models.CharField(max_length=50, choices=RADIO_TYPES)
-    radioCoverageId = models.CharField(max_length=50, blank=True, null=True)
-    centerFrequency = models.FloatField(blank=True, null=True)
-    bandwidth = models.FloatField(blank=True, null=True)
-    dataRate = models.FloatField(blank=True, null=True)
-    transmitPower = models.FloatField(blank=True, null=True)
-    receiveSensitivity = models.FloatField(blank=True, null=True)
-    receiveThreshold = models.FloatField(blank=True, null=True)
-    antennaType = models.CharField(max_length=50, choices=ANTENNA_TYPES)
-    gain = models.FloatField(default=0.0)
-    height = models.FloatField(default=1.5)
-    efficiency = models.FloatField(default=0.8)
-    mismatchLoss = models.FloatField(default=0.3)
-    cableLoss = models.FloatField(default=0.0)
-    connectionLoss = models.FloatField(default=0.2)
-    azimuth = models.FloatField(default=0)
-    elevation = models.FloatField(default=0)
-    roll = models.FloatField(default=0)
-    patternType = models.CharField(max_length=50, choices=PATTERN_TYPES, blank=True, null=True)
-    patternNumber = models.CharField(max_length=50, blank=True, null=True)
-    azimuthPatternFile = models.FileField(upload_to='antenna/azimuth/', blank=True, null=True)
-    elevationPatternFile = models.FileField(upload_to='antenna/elevation/', blank=True, null=True)
-    patternCoverageParameter = models.FloatField(blank=True, null=True)
-    azimuthResolution = models.FloatField(blank=True, null=True)
-    elevationResolution = models.FloatField(blank=True, null=True)
-
-    def __str__(self):
-        return f"Physical Layer for {self.interface.node.nodeName} - Interface {self.interface.interface_index}"
-
-
-class MacLayer(models.Model):
-    MAC_PROTOCOLS = [
-        ('802.11', '802.11'),
-        # 其他MAC协议
-    ]
-
-    interface = models.OneToOneField(Interface, on_delete=models.CASCADE, related_name='mac_layer')
-    macProtocol = models.CharField(max_length=50, choices=MAC_PROTOCOLS)
-    shortPacketLimit = models.IntegerField(default=7)
-    longPacketLimit = models.IntegerField(default=4)
-    rtsThreshold = models.IntegerField(default=0)
-    macPropagationDelay = models.FloatField(default=1)  # 微秒
-
-    def __str__(self):
-        return f"MAC Layer for {self.interface.node.nodeName} - Interface {self.interface.interface_index}"
-
-
-class NetworkLayer(models.Model):
-    NETWORK_PROTOCOLS = [
-        ('IPv4', 'IPv4'),
-        # 其他网络协议
-    ]
-
-    interface = models.OneToOneField(Interface, on_delete=models.CASCADE, related_name='network_layer')
-    networkProtocol = models.CharField(max_length=50, choices=NETWORK_PROTOCOLS)
-    ipv4Address = models.GenericIPAddressField()
-    ipv4SubnetMask = models.GenericIPAddressField()
-    ipFragmentationUnit = models.IntegerField(default=2048)
-
-    def __str__(self):
-        return f"Network Layer for {self.interface.node.nodeName} - Interface {self.interface.interface_index}"
-
-
-class RoutingProtocol(models.Model):
-    ROUTING_PROTOCOLS = [
-        ('Bellman Ford', 'Bellman Ford'),
-        # 其他路由协议
-    ]
-
-    interface = models.OneToOneField(Interface, on_delete=models.CASCADE, related_name='routing_protocol')
-    routingProtocol = models.CharField(max_length=50, choices=ROUTING_PROTOCOLS)
-    enableMulticast = models.BooleanField(default=False)
-    enableHSRP = models.BooleanField(default=False)
-
-    def __str__(self):
-        return f"Routing Protocol for {self.interface.node.nodeName} - Interface {self.interface.interface_index}"
-
-
 

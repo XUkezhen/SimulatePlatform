@@ -1,6 +1,8 @@
 import shutil
 import sys
 from pathlib import Path
+import importlib.util
+from functools import lru_cache
 
 from pk.django.core.cache import cache
 
@@ -14,6 +16,7 @@ import struct
 import time
 import threading
 import binascii
+import math
 
 from django.views import View
 from django.middleware.csrf import get_token
@@ -46,7 +49,7 @@ from django.template.loader import render_to_string
 from django.views.decorators.http import require_http_methods
 from .models import *
 from .forms import *
-from django.db.models import Q, Max, Prefetch
+from django.db.models import Q, Prefetch
 from django.views.decorators.csrf import csrf_exempt
 from django.core.paginator import Paginator, PageNotAnInteger, EmptyPage
 from .serializers import ConfigurationSerializer
@@ -1034,6 +1037,135 @@ def create_default_interface(node):
     return interface
 
 
+def _is_leo_special_type(value):
+    return value in {"LEO", "近地卫星"}
+
+
+def _parse_datetime_input(value, field_name):
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        raise ValidationError(f"缺少必填字段: {field_name}")
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            raise ValidationError(f"{field_name} 时间格式无效")
+    raise ValidationError(f"{field_name} 时间格式无效")
+
+
+def _parse_float_input(value, field_name):
+    if value in [None, '']:
+        raise ValidationError(f"缺少必填字段: {field_name}")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field_name} 必须是数字")
+
+
+def _parse_int_input(value, field_name):
+    if value in [None, '']:
+        raise ValidationError(f"缺少必填字段: {field_name}")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field_name} 必须是整数")
+
+
+@lru_cache(maxsize=1)
+def _load_orbit_math_module():
+    module_path = Path(__file__).with_name("import math.py")
+    spec = importlib.util.spec_from_file_location("api_import_math", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载轨道计算模块: {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _calculate_leo_points(payload):
+    start_dt = _parse_datetime_input(payload.get('startTime'), 'startTime')
+    epoch_dt = _parse_datetime_input(payload.get('epochTime'), 'epochTime')
+    step_size = _parse_float_input(payload.get('orbitStepSize'), 'orbitStepSize')
+    step_count = _parse_int_input(payload.get('orbitStepCount'), 'orbitStepCount')
+    inclination = _parse_float_input(payload.get('orbitInclination'), 'orbitInclination')
+    arg_perigee = _parse_float_input(payload.get('orbitArgPerigee'), 'orbitArgPerigee')
+    raan = _parse_float_input(payload.get('orbitRaan'), 'orbitRaan')
+    mean_anomaly = _parse_float_input(payload.get('orbitMeanAnomaly'), 'orbitMeanAnomaly')
+    altitude = _parse_float_input(payload.get('orbitAltitude'), 'orbitAltitude')
+
+    if step_size <= 0:
+        raise ValidationError("orbitStepSize 必须大于 0")
+    if step_count <= 0:
+        raise ValidationError("orbitStepCount 必须大于 0")
+
+    orbit_math_module = _load_orbit_math_module()
+    elements = {
+        'a': 6378137 + altitude * 1000.0,
+        'e': 0.0,
+        'i': math.radians(inclination),
+        'Omega': math.radians(raan),
+        'omega': math.radians(arg_perigee),
+        'M0': math.radians(mean_anomaly),
+        'epoch': epoch_dt.isoformat(),
+    }
+    calculated_points = orbit_math_module.calculate_orbit_positions(
+        elements=elements,
+        start_time_str=start_dt.isoformat(),
+        step_size_sec=step_size,
+        num_steps=step_count,
+    )
+    if not calculated_points:
+        raise ValidationError("未计算出任何轨道点")
+
+    start_point = calculated_points[0]
+    via_points = calculated_points[1:]
+    orbit_payload = {
+        'epochTime': epoch_dt,
+        'orbitStepSize': step_size,
+        'orbitStepCount': step_count,
+        'orbitInclination': inclination,
+        'orbitArgPerigee': arg_perigee,
+        'orbitRaan': raan,
+        'orbitMeanAnomaly': mean_anomaly,
+        'orbitAltitude': altitude,
+    }
+    return start_dt, start_point, via_points, orbit_payload
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def calculate_leo_via_points(request):
+    try:
+        data = json.loads(request.body.decode('utf-8'))
+        start_dt, start_point, via_points, orbit_payload = _calculate_leo_points(data)
+        return JsonResponse({
+            'status': 'success',
+            'startTime': start_dt.isoformat(),
+            'startPoint': start_point,
+            'viaPoints': via_points,
+            'orbit': {
+                'epochTime': orbit_payload['epochTime'].isoformat(),
+                'orbitStepSize': orbit_payload['orbitStepSize'],
+                'orbitStepCount': orbit_payload['orbitStepCount'],
+                'orbitInclination': orbit_payload['orbitInclination'],
+                'orbitArgPerigee': orbit_payload['orbitArgPerigee'],
+                'orbitRaan': orbit_payload['orbitRaan'],
+                'orbitMeanAnomaly': orbit_payload['orbitMeanAnomaly'],
+                'orbitAltitude': orbit_payload['orbitAltitude'],
+            }
+        }, json_dumps_params={'ensure_ascii': False})
+    except json.JSONDecodeError:
+        return JsonResponse({'status': 'error', 'message': '无效的JSON格式'}, status=400)
+    except ValidationError as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+    except Exception as e:
+        return JsonResponse({'status': 'error', 'message': f'轨道计算失败: {str(e)}'}, status=500)
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def add_node_list(request):
@@ -1084,22 +1216,38 @@ def add_node_list(request):
                     setattr(node, field, data[field])
 
             elif node.nodeType == 'normalNode':
-                required_fields = ['lon', 'lat', 'alt', 'startTime']
-                for field in required_fields:
-                    if field not in data:
-                        raise ValidationError(f'缺少普通节点必填字段: {field}')
-                    setattr(node, field, data[field])
+                if _is_leo_special_type(node.specialType):
+                    start_dt, start_point, via_points, orbit_payload = _calculate_leo_points(data)
+                    node.startTime = start_dt
+                    node.lon = start_point.get('lon')
+                    node.lat = start_point.get('lat')
+                    node.alt = start_point.get('alt')
+                    node.viaPoints = via_points
+                    node.epochTime = orbit_payload['epochTime']
+                    node.orbitStepSize = orbit_payload['orbitStepSize']
+                    node.orbitStepCount = orbit_payload['orbitStepCount']
+                    node.orbitInclination = orbit_payload['orbitInclination']
+                    node.orbitArgPerigee = orbit_payload['orbitArgPerigee']
+                    node.orbitRaan = orbit_payload['orbitRaan']
+                    node.orbitMeanAnomaly = orbit_payload['orbitMeanAnomaly']
+                    node.orbitAltitude = orbit_payload['orbitAltitude']
+                else:
+                    required_fields = ['lon', 'lat', 'alt', 'startTime']
+                    for field in required_fields:
+                        if field not in data:
+                            raise ValidationError(f'缺少普通节点必填字段: {field}')
+                        setattr(node, field, data[field])
 
-                via_points = data.get('viaPoints')
-                if via_points:
-                    if not isinstance(via_points, list):
-                        raise ValidationError('viaPoints必须是列表')
-                    for point in via_points:
-                        if not isinstance(point, dict):
-                            raise ValidationError('每个viaPoint必须是字典')
-                        if not all(k in point for k in ['lon', 'lat', 'alt', 'time']):
-                            raise ValidationError('每个viaPoint必须包含 lon、lat、alt 和 time')
-                node.viaPoints = via_points
+                    via_points = data.get('viaPoints')
+                    if via_points:
+                        if not isinstance(via_points, list):
+                            raise ValidationError('viaPoints必须是列表')
+                        for point in via_points:
+                            if not isinstance(point, dict):
+                                raise ValidationError('每个viaPoint必须是字典')
+                            if not all(k in point for k in ['lon', 'lat', 'alt', 'time']):
+                                raise ValidationError('每个viaPoint必须包含 lon、lat、alt 和 time')
+                    node.viaPoints = via_points
             else:
                 raise ValidationError('无效的节点类型')
 
@@ -1262,6 +1410,14 @@ def get_node_list(request):
                 'meanMotion': node.meanMotion,
                 'raan': node.raan,
                 'startTime': node.startTime.isoformat() if node.startTime else None,
+                'epochTime': node.epochTime.isoformat() if node.epochTime else None,
+                'orbitStepSize': node.orbitStepSize,
+                'orbitStepCount': node.orbitStepCount,
+                'orbitInclination': node.orbitInclination,
+                'orbitArgPerigee': node.orbitArgPerigee,
+                'orbitRaan': node.orbitRaan,
+                'orbitMeanAnomaly': node.orbitMeanAnomaly,
+                'orbitAltitude': node.orbitAltitude,
                 'viaPoints': node.viaPoints if node.viaPoints else [],
                 'specialType':node.specialType,
                 # 'details':node.details
@@ -1332,27 +1488,54 @@ def edit_node_list(request, node_id):
             node.startTime = data.get('startTime', node.startTime)
 
         elif node.nodeType == 'normalNode':
-            node.lon = data.get('lon', node.lon)
-            node.lat = data.get('lat', node.lat)
-            node.alt = data.get('alt', node.alt)
-            node.startTime = data.get('startTime', node.startTime)
+            if _is_leo_special_type(node.specialType):
+                calc_payload = {
+                    'startTime': data.get('startTime', node.startTime.isoformat() if isinstance(node.startTime, datetime) else node.startTime),
+                    'epochTime': data.get('epochTime', node.epochTime.isoformat() if isinstance(node.epochTime, datetime) else node.epochTime),
+                    'orbitStepSize': data.get('orbitStepSize', node.orbitStepSize),
+                    'orbitStepCount': data.get('orbitStepCount', node.orbitStepCount),
+                    'orbitInclination': data.get('orbitInclination', node.orbitInclination),
+                    'orbitArgPerigee': data.get('orbitArgPerigee', node.orbitArgPerigee),
+                    'orbitRaan': data.get('orbitRaan', node.orbitRaan),
+                    'orbitMeanAnomaly': data.get('orbitMeanAnomaly', node.orbitMeanAnomaly),
+                    'orbitAltitude': data.get('orbitAltitude', node.orbitAltitude),
+                }
+                start_dt, start_point, via_points, orbit_payload = _calculate_leo_points(calc_payload)
+                node.startTime = start_dt
+                node.lon = start_point.get('lon')
+                node.lat = start_point.get('lat')
+                node.alt = start_point.get('alt')
+                node.viaPoints = via_points
+                node.epochTime = orbit_payload['epochTime']
+                node.orbitStepSize = orbit_payload['orbitStepSize']
+                node.orbitStepCount = orbit_payload['orbitStepCount']
+                node.orbitInclination = orbit_payload['orbitInclination']
+                node.orbitArgPerigee = orbit_payload['orbitArgPerigee']
+                node.orbitRaan = orbit_payload['orbitRaan']
+                node.orbitMeanAnomaly = orbit_payload['orbitMeanAnomaly']
+                node.orbitAltitude = orbit_payload['orbitAltitude']
+            else:
+                node.lon = data.get('lon', node.lon)
+                node.lat = data.get('lat', node.lat)
+                node.alt = data.get('alt', node.alt)
+                node.startTime = data.get('startTime', node.startTime)
 
-            # 处理 viaPoints
-            if 'viaPoints' in data:
-                via_points = data['viaPoints']
-                try:
-                    if not isinstance(via_points, list):
-                        return JsonResponse({'status': 'error', 'message': 'viaPoints must be a JSON list of points'},
-                                            status=400)
-                    for point in via_points:
-                        if not isinstance(point, dict) or \
-                                not all(key in point for key in ['lon', 'lat', 'alt', 'time']):
-                            return JsonResponse({'status': 'error',
-                                                 'message': 'Each viaPoint must contain \'lon\', \'lat\', \'alt\', and \'time\''},
+                # 处理 viaPoints
+                if 'viaPoints' in data:
+                    via_points = data['viaPoints']
+                    try:
+                        if not isinstance(via_points, list):
+                            return JsonResponse({'status': 'error', 'message': 'viaPoints must be a JSON list of points'},
                                                 status=400)
-                    node.viaPoints = via_points
-                except (TypeError, ValueError):
-                    return JsonResponse({'status': 'error', 'message': 'viaPoints must be valid JSON'}, status=400)
+                        for point in via_points:
+                            if not isinstance(point, dict) or \
+                                    not all(key in point for key in ['lon', 'lat', 'alt', 'time']):
+                                return JsonResponse({'status': 'error',
+                                                     'message': 'Each viaPoint must contain \'lon\', \'lat\', \'alt\', and \'time\''},
+                                                    status=400)
+                        node.viaPoints = via_points
+                    except (TypeError, ValueError):
+                        return JsonResponse({'status': 'error', 'message': 'viaPoints must be valid JSON'}, status=400)
         else:
             return JsonResponse({'status': 'error', 'message': 'Invalid node type'}, status=400)
 
@@ -1463,6 +1646,7 @@ def get_configuration_list(request):
         'cbrEndTime': config.cbrEndTime,
         'cbrSendInterval': config.cbrSendInterval,
         'cbrPacketSize': config.cbrPacketSize,
+        'cbrPrecedence': config.cbrPrecedence,
         'TransferType': config.TransferType,
         'ftpStartTime': config.ftpStartTime,
         'ftpPacketCount': config.ftpPacketCount,
@@ -1517,6 +1701,7 @@ def edit_configuration_list(request, configuration_id):
         config.cbrEndTime = data.get('cbrEndTime', config.cbrEndTime)
         config.cbrSendInterval = data.get('cbrSendInterval', config.cbrSendInterval)
         config.cbrPacketSize = data.get('cbrPacketSize', config.cbrPacketSize)
+        config.cbrPrecedence = data.get('cbrPrecedence', config.cbrPrecedence)
         config.TransferType = data.get('TransferType', config.TransferType)
     elif business_type == 'FTP':
         config.ftpStartTime = data.get('ftpStartTime', config.ftpStartTime)
@@ -2901,208 +3086,6 @@ def generate_exata_config(request):
         return HttpResponse(f'Error generating Exata config: {str(e)}', status=500)
 
 
-@csrf_exempt
-@require_http_methods(["POST"])
-def configure_protocol(request, node_id, interfaceIndex):
-    try:
-        # 查找接口
-        interface = Interface.objects.get(node_id=node_id, interfaceIndex=interfaceIndex)
-    except Interface.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': 'Interface not found'}, status=404)
-
-    try:
-        data = json.loads(request.body)
-
-        # 更新物理层配置
-        physical_layer_data = data.get('physicalLayer', {})
-        if hasattr(interface, 'physical_layer'):
-            physical_layer = interface.physical_layer
-        else:
-            physical_layer = PhysicalLayer(interface=interface)
-
-        physical_layer.radioType = physical_layer_data.get('radioType', physical_layer.radioType)
-        physical_layer.radioCoverageId = physical_layer_data.get('radioCoverageId', physical_layer.radioCoverageId)
-        physical_layer.centerFrequency = physical_layer_data.get('centerFrequency', physical_layer.centerFrequency)
-        physical_layer.bandwidth = physical_layer_data.get('bandwidth', physical_layer.bandwidth)
-        physical_layer.dataRate = physical_layer_data.get('dataRate', physical_layer.dataRate)
-        physical_layer.transmitPower = physical_layer_data.get('transmitPower', physical_layer.transmitPower)
-        physical_layer.receiveSensitivity = physical_layer_data.get('receiveSensitivity',
-                                                                    physical_layer.receiveSensitivity)
-        physical_layer.receiveThreshold = physical_layer_data.get('receiveThreshold', physical_layer.receiveThreshold)
-        physical_layer.antennaType = physical_layer_data.get('antennaType', physical_layer.antennaType)
-        physical_layer.gain = physical_layer_data.get('gain', physical_layer.gain)
-        physical_layer.height = physical_layer_data.get('height', physical_layer.height)
-        physical_layer.efficiency = physical_layer_data.get('efficiency', physical_layer.efficiency)
-        physical_layer.mismatchLoss = physical_layer_data.get('mismatchLoss', physical_layer.mismatchLoss)
-        physical_layer.cableLoss = physical_layer_data.get('cableLoss', physical_layer.cableLoss)
-        physical_layer.connectionLoss = physical_layer_data.get('connectionLoss', physical_layer.connectionLoss)
-        physical_layer.azimuth = physical_layer_data.get('azimuth', physical_layer.azimuth)
-        physical_layer.elevation = physical_layer_data.get('elevation', physical_layer.elevation)
-        physical_layer.roll = physical_layer_data.get('roll', physical_layer.roll)
-
-        # 如果是 Patterned 天线，更新额外的字段
-        if physical_layer.antennaType == 'Patterned':
-            physical_layer.patternType = physical_layer_data.get('patternType', physical_layer.patternType)
-            physical_layer.patternNumber = physical_layer_data.get('patternNumber', physical_layer.patternNumber)
-            physical_layer.azimuthPatternFile = physical_layer_data.get('azimuthPatternFile',
-                                                                        physical_layer.azimuthPatternFile)
-            physical_layer.elevationPatternFile = physical_layer_data.get('elevationPatternFile',
-                                                                          physical_layer.elevationPatternFile)
-            physical_layer.patternCoverageParameter = physical_layer_data.get('patternCoverageParameter',
-                                                                              physical_layer.patternCoverageParameter)
-            physical_layer.azimuthResolution = physical_layer_data.get('azimuthResolution',
-                                                                       physical_layer.azimuthResolution)
-            physical_layer.elevationResolution = physical_layer_data.get('elevationResolution',
-                                                                         physical_layer.elevationResolution)
-
-        physical_layer.save()
-
-        # 更新MAC层配置
-        mac_layer_data = data.get('macLayer', {})
-        if hasattr(interface, 'mac_layer'):
-            mac_layer = interface.mac_layer
-        else:
-            mac_layer = MacLayer(interface=interface)
-
-        mac_layer.macProtocol = mac_layer_data.get('macProtocol', mac_layer.macProtocol)
-        mac_layer.shortPacketLimit = mac_layer_data.get('shortPacketLimit', mac_layer.shortPacketLimit)
-        mac_layer.longPacketLimit = mac_layer_data.get('longPacketLimit', mac_layer.longPacketLimit)
-        mac_layer.rtsThreshold = mac_layer_data.get('rtsThreshold', mac_layer.rtsThreshold)
-        mac_layer.macPropagationDelay = mac_layer_data.get('macPropagationDelay', mac_layer.macPropagationDelay)
-        mac_layer.save()
-
-        # 更新网络层配置
-        network_layer_data = data.get('networkLayer', {})
-        if hasattr(interface, 'network_layer'):
-            network_layer = interface.network_layer
-        else:
-            network_layer = NetworkLayer(interface=interface)
-
-        network_layer.networkProtocol = network_layer_data.get('networkProtocol', network_layer.networkProtocol)
-        network_layer.ipv4Address = network_layer_data.get('ipv4Address', network_layer.ipv4Address)
-        network_layer.ipv4SubnetMask = network_layer_data.get('ipv4SubnetMask', network_layer.ipv4SubnetMask)
-        network_layer.ipFragmentationUnit = network_layer_data.get('ipFragmentationUnit',
-                                                                   network_layer.ipFragmentationUnit)
-        network_layer.save()
-
-        # 更新路由协议配置
-        routing_protocol_data = data.get('routingProtocol', {})
-        if hasattr(interface, 'routing_protocol'):
-            routing_protocol = interface.routing_protocol
-        else:
-            routing_protocol = RoutingProtocol(interface=interface)
-
-        routing_protocol.routingProtocol = routing_protocol_data.get('routingProtocol',
-                                                                     routing_protocol.routingProtocol)
-        routing_protocol.enableMulticast = routing_protocol_data.get('enableMulticast',
-                                                                     routing_protocol.enableMulticast)
-        routing_protocol.enableHSRP = routing_protocol_data.get('enableHSRP', routing_protocol.enableHSRP)
-        routing_protocol.save()
-
-        return JsonResponse({'status': 'success'})
-
-    except json.JSONDecodeError:
-        return JsonResponse({'status': 'error', 'message': 'Invalid JSON format'}, status=400)
-    except Exception as e:
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
-
-
-@require_http_methods(["GET"])
-def get_interface_config(request, node_id, interfaceIndex):
-    try:
-        # 查找接口
-        interface = Interface.objects.get(node_id=node_id, interfaceIndex=interfaceIndex)
-
-        # 获取物理层配置
-        try:
-            physical_layer = interface.physical_layer
-            physical_layer_data = {
-                'radioType': physical_layer.radioType,
-                'radioCoverageId': physical_layer.radioCoverageId,
-                'centerFrequency': physical_layer.centerFrequency,
-                'bandwidth': physical_layer.bandwidth,
-                'dataRate': physical_layer.dataRate,
-                'transmitPower': physical_layer.transmitPower,
-                'receiveSensitivity': physical_layer.receiveSensitivity,
-                'receiveThreshold': physical_layer.receiveThreshold,
-                'antennaType': physical_layer.antennaType,
-                'gain': physical_layer.gain,
-                'height': physical_layer.height,
-                'efficiency': physical_layer.efficiency,
-                'mismatchLoss': physical_layer.mismatchLoss,
-                'cableLoss': physical_layer.cableLoss,
-                'connectionLoss': physical_layer.connectionLoss,
-                'azimuth': physical_layer.azimuth,
-                'elevation': physical_layer.elevation,
-                'roll': physical_layer.roll,
-            }
-            if physical_layer.antennaType == 'Patterned':
-                physical_layer_data.update({
-                    'patternType': physical_layer.patternType,
-                    'patternNumber': physical_layer.patternNumber,
-                    'azimuthPatternFile': physical_layer.azimuthPatternFile,
-                    'elevationPatternFile': physical_layer.elevationPatternFile,
-                    'patternCoverageParameter': physical_layer.patternCoverageParameter,
-                    'azimuthResolution': physical_layer.azimuthResolution,
-                    'elevationResolution': physical_layer.elevationResolution,
-                })
-        except PhysicalLayer.DoesNotExist:
-            physical_layer_data = None
-
-        # 获取MAC层配置
-        try:
-            mac_layer = interface.mac_layer
-            mac_layer_data = {
-                'macProtocol': mac_layer.macProtocol,
-                'shortPacketLimit': mac_layer.shortPacketLimit,
-                'longPacketLimit': mac_layer.longPacketLimit,
-                'rtsThreshold': mac_layer.rtsThreshold,
-                'macPropagationDelay': mac_layer.macPropagationDelay,
-            }
-        except MacLayer.DoesNotExist:
-            mac_layer_data = None
-
-        # 获取网络层配置
-        try:
-            network_layer = interface.network_layer
-            network_layer_data = {
-                'networkProtocol': network_layer.networkProtocol,
-                'ipv4Address': network_layer.ipv4Address,
-                'ipv4SubnetMask': network_layer.ipv4SubnetMask,
-                'ipFragmentationUnit': network_layer.ipFragmentationUnit,
-            }
-        except NetworkLayer.DoesNotExist:
-            network_layer_data = None
-
-        # 获取路由协议配置
-        try:
-            routing_protocol = interface.routing_protocol
-            routing_protocol_data = {
-                'routingProtocol': routing_protocol.routingProtocol,
-                'enableMulticast': routing_protocol.enableMulticast,
-                'enableHSRP': routing_protocol.enableHSRP,
-            }
-        except RoutingProtocol.DoesNotExist:
-            routing_protocol_data = None
-
-        # 构建响应数据
-        response_data = {
-            'interfaceIp': interface.interfaceIp,
-            'interfaceIndex': interface.interfaceIndex,
-            'physicalLayer': physical_layer_data,
-            'macLayer': mac_layer_data,
-            'networkLayer': network_layer_data,
-            'routingProtocol': routing_protocol_data,
-        }
-
-        return JsonResponse({'status': 'success', 'data': response_data})
-
-    except Interface.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': 'Interface not found'}, status=404)
-    except Exception as e:
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
-
-
 '''
 生成文件
 '''
@@ -3348,6 +3331,33 @@ def save_slot_table(request):
             return JsonResponse({"status": "error", "message": str(e)})
     else:
         return JsonResponse({"status": "error", "message": "POST only"})
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_slot_table(request):
+    try:
+        scene_id = request.GET.get("sceneId")
+        if not scene_id:
+            return JsonResponse({"status": "error", "message": "sceneId missing"}, status=400)
+
+        try:
+            scene = Scene.objects.get(id=scene_id)
+        except Scene.DoesNotExist:
+            return JsonResponse({"status": "error", "message": "Scene not found"}, status=404)
+
+        slot_table_obj = SlotTable.objects.filter(scene=scene).order_by('-id').first()
+        if not slot_table_obj:
+            return JsonResponse({"status": "error", "message": "SlotTable not found"}, status=404)
+
+        return JsonResponse({
+            "status": "success",
+            "slotTableId": slot_table_obj.id,
+            "sceneId": scene.id,
+            "data": slot_table_obj.data
+        }, json_dumps_params={'ensure_ascii': False})
+    except Exception as e:
+        return JsonResponse({"status": "error", "message": str(e)}, status=500)
 
 def download_all_files(request):
     scene_id = request.GET.get('sceneId')
@@ -3662,11 +3672,20 @@ def generate_scene_app_content(scene,node_id_map):
             end_time = config.cbrEndTime
             packet_size = config.cbrPacketSize
             interval = config.cbrSendInterval
+            precedence = config.cbrPrecedence
 
             time_offset = (start_time - scene.startTime).total_seconds() if start_time else 0
             end_time_offset = (end_time - scene.startTime).total_seconds() if end_time else 0
 
-            config_line = f"{config.businessType} {node_id_map[config.sourceNodeId.id]} {node_id_map[config.destinationNodeId.id]} 5000 {packet_size} {interval} {int(time_offset)} {int(end_time_offset)} {config.TransferType}\n"
+            config_line = (
+                f"{config.businessType} {node_id_map[config.sourceNodeId.id]} "
+                f"{node_id_map[config.destinationNodeId.id]} 5000 {packet_size} {interval} "
+                f"{int(time_offset)} {int(end_time_offset)}"
+            )
+            if precedence is not None:
+                config_line += f" PRECEDENCE {precedence}"
+            config_line += f" {config.TransferType}"
+            config_line += "\n"
             content += config_line
 
         elif config.businessType == 'FTP':
@@ -3829,7 +3848,8 @@ def generate_scene_fault_content(scene,node_id_map):
             iface_type = iface.interfaceType.upper()
             iface_index = iface.interfaceIndex
             link_id = link.id
-            line = f"INTERFACE-FAULT {iface_type}{link_id}/{node.id}/{iface_index} {start_time} {end_time} NO"
+            mapped_node_id = node_id_map.get(node.id, node.id)
+            line = f"INTERFACE-FAULT {iface_type}{link_id}/{mapped_node_id}/{iface_index} {start_time} {end_time} NO"
             result.append(line)
     return "\n".join(result)
 
@@ -5605,7 +5625,7 @@ class SocketView(View):
 
                     working_directory=absolute_path,
                     # executable_path=r"D:\Scalable\exata7.3.0.0\exata\7.3.0.0\bin\exata.exe",
-                    executable_path=r"D:\exata\exata\exata\7.3.0.0\bin\exata.exe",#xkz exata地址
+                    executable_path=r"D:\Exata\exata\7.3.0.0\bin\exata.exe",#xkz exata地址
                     config_file=f"{selected_scene_name}.config",
                     # config_file="fina1.config"
                 )

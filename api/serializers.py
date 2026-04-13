@@ -23,6 +23,14 @@ class ConfigurationSerializer(serializers.ModelSerializer):
             required_fields = ['cbrStartTime', 'cbrEndTime', 'cbrSendInterval', 'cbrPacketSize']
             start_time = data.get('cbrStartTime')
             end_time = data.get('cbrEndTime')
+            precedence = data.get('cbrPrecedence')
+            if precedence not in [None, '']:
+                try:
+                    precedence_value = int(precedence)
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError("CBR 的 PRECEDENCE 必须是整数。")
+                if precedence_value < 0:
+                    raise serializers.ValidationError("CBR 的 PRECEDENCE 不能小于 0。")
 
         elif business_type == 'FTP':
             required_fields = ['ftpStartTime', 'ftpPacketCount']
