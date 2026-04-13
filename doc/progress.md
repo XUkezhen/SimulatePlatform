@@ -16,7 +16,15 @@
   `.nodes` 每行格式为：`节点ID 时间(秒) (纬度 经度 高度) 0 0 0`
   `node.txt` 每行格式为：`节点ID 时间(秒) 纬度 经度 高度 nodeImage nodeName`
 
+## 2026-04-13
+
+- 优化 `exata_config.template` 中 Routing 配置的写入逻辑。
+- 改动：只写入 `ROUTING-PROTOCOL-IPv4` 参数，过滤默认值 `BellmanFord`。
+- 位置：模板第469-472行、第478-481行、第486-489行（sub/link 类型接口）。
+- 提交说明：`refactor: simplify routing config in exata template`
+
 ## 模板
+
 - 日期：
 - 改动：
 - 本地提交：

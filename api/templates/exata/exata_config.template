@@ -466,30 +466,27 @@ LINK N8-{{ link.subnet.subnetIp }} { {{ node_id_map[link.sourceNodeId.id] }}, {{
       {% for key, value in interface.detail.get('MAC', {}).items() %}
 [SUB{{ interface.subnet.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
       {% endfor %}
-      {% for key, value in interface.detail.get('Routing', {}).items() %}
-        {% if not (key == 'ROUTING-PROTOCOL-IPv4' and value == 'BellmanFord') %}
-[SUB{{ interface.subnet.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
-        {% endif %}
-      {% endfor %}
+      {% set routing_protocol = interface.detail.get('Routing', {}).get('ROUTING-PROTOCOL-IPv4') %}
+      {% if routing_protocol and routing_protocol != 'BellmanFord' %}
+[SUB{{ interface.subnet.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
+      {% endif %}
     {% elif interface.interfaceType == 'link' %}
       {% if interface.source_link %}
         {% for key, value in interface.detail.get('MAC', {}).items() %}
 [LINK{{ interface.source_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
         {% endfor %}
-        {% for key, value in interface.detail.get('Routing', {}).items() %}
-          {% if not (key == 'ROUTING-PROTOCOL-IPv4' and value == 'BellmanFord') %}
-[LINK{{ interface.source_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
-          {% endif %}
-        {% endfor %}
+        {% set routing_protocol = interface.detail.get('Routing', {}).get('ROUTING-PROTOCOL-IPv4') %}
+        {% if routing_protocol and routing_protocol != 'BellmanFord' %}
+[LINK{{ interface.source_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
+        {% endif %}
       {% elif interface.destination_link %}
        {% for key, value in interface.detail.get('MAC', {}).items() %}
 [LINK{{ interface.destination_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
         {% endfor %}
-        {% for key, value in interface.detail.get('Routing', {}).items() %}
-          {% if not (key == 'ROUTING-PROTOCOL-IPv4' and value == 'BellmanFord') %}
-[LINK{{ interface.destination_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
-          {% endif %}
-        {% endfor %}
+        {% set routing_protocol = interface.detail.get('Routing', {}).get('ROUTING-PROTOCOL-IPv4') %}
+        {% if routing_protocol and routing_protocol != 'BellmanFord' %}
+[LINK{{ interface.destination_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
+        {% endif %}
       {% endif %}
     {% endif %}
   {% endfor %}
