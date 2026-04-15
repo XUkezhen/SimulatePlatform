@@ -3212,25 +3212,7 @@ def generate_fault_file(request):
         # 获取指定场景的所有故障记录
         errors = Error.objects.filter(sceneId=scene)
 
-        # 准备 fault.txt 文件内容
-        fault_content = []
-        for error in errors:
-            # 获取节点的所有接口
-            interfaces = Interface.objects.filter(node=error.nodeId)
-            if not interfaces:
-                # 如果节点没有接口，跳过此错误记录
-                continue
-
-            # 计算故障开始和结束时间相对于场景开始时间的秒数
-            start_time = (error.errorStartTime - scene.startTime).total_seconds()
-            end_time = (error.errorEndTime - scene.startTime).total_seconds()
-
-            # 构建故障数据行，为每个接口生成一行
-            for interface in interfaces:
-                line = (
-                    f"{error.nodeId.id} {interface.interfaceIndex} {int(start_time)} {int(end_time)}\n"
-                )
-                fault_content.append(line)
+        fault_content = _build_fault_txt_lines(scene, errors)
 
         # 将内容写入文件或返回给用户
         response = HttpResponse(content_type='text/plain')
@@ -3241,6 +3223,32 @@ def generate_fault_file(request):
 
     except Exception as e:
         return HttpResponse(f'Error generating fault file: {str(e)}', status=500)
+
+
+def _build_fault_txt_lines(scene, errors, node_id_map=None):
+    if node_id_map is None:
+        node_id_map = {
+            node.id: idx + 1
+            for idx, node in enumerate(Node.objects.filter(sceneId=scene))
+        }
+
+    fault_content = []
+    for error in errors:
+        interfaces = Interface.objects.filter(node=error.nodeId)
+        if not interfaces:
+            continue
+
+        start_time = (error.errorStartTime - scene.startTime).total_seconds()
+        end_time = (error.errorEndTime - scene.startTime).total_seconds()
+        exported_node_id = node_id_map.get(error.nodeId.id, error.nodeId.id)
+
+        for interface in interfaces:
+            line = (
+                f"{exported_node_id} {interface.interfaceIndex} {int(start_time)} {int(end_time)}\n"
+            )
+            fault_content.append(line)
+
+    return fault_content
 
 
 def generate_initial_file(request):
@@ -3625,18 +3633,7 @@ def download_all_files(request):
     response.write("\n")
 
     # 生成并保存 fault.txt 文件
-    fault_txt_content = []
-    for error in errors:
-        interfaces = Interface.objects.filter(node=error.nodeId)#??故障节点还是接口，没有进行映射
-        if not interfaces:
-            continue
-        start_time = (error.errorStartTime - scene.startTime).total_seconds()
-        end_time = (error.errorEndTime - scene.startTime).total_seconds()
-        for interface in interfaces:
-            line = (
-                f"{error.nodeId.id} {interface.interfaceIndex} {int(start_time)} {int(end_time)}\n"
-            )
-            fault_txt_content.append(line)
+    fault_txt_content = _build_fault_txt_lines(scene, errors, node_id_map=node_id_map)
 
     fault_txt_path = os.path.join(scene_folder, "fault.txt")
     with open(fault_txt_path, 'w', encoding='utf-8') as f:
