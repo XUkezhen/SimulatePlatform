@@ -72,6 +72,8 @@ path('connect/', SocketView.as_view(), name='connect'),
     path('api/download_all_files', views.download_all_files, name='download_all_files'),
     path('api/analysis', views.analysis_results, name='analysis-results'),
     path('api/get_scene_files/', views.get_scene_files, name='get_scene_files'),
+    path('api/get_rx_power_log/', views.get_rx_power_log, name='get_rx_power_log'),
+    path('api/get_ospf_detected/', views.get_ospf_detected, name='get_ospf_detected'),
 
     path('api/get_exata_scene_files', exata_integration.get_exata_scene_files, name='get_exata_scene_files_no_slash'),
     path('api/get_exata_scene_files/', exata_integration.get_exata_scene_files, name='get_exata_scene_files'),

@@ -4278,6 +4278,99 @@ def get_scene_files(request):
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
+def _get_scene_files_root():
+    if getattr(settings, 'MEDIA_ROOT', ''):
+        return Path(settings.MEDIA_ROOT) / 'scene_files'
+    return Path(settings.BASE_DIR) / 'scene_files'
+
+
+def _read_scene_text_file(scene_id, file_name):
+    try:
+        scene = Scene.objects.get(id=scene_id)
+    except Scene.DoesNotExist:
+        return None, JsonResponse({
+            'status': 'error',
+            'message': f'场景ID {scene_id} 不存在'
+        }, status=404)
+
+    scene_folder = (_get_scene_files_root() / scene.sceneName).resolve(strict=False)
+    scene_root = _get_scene_files_root().resolve(strict=False)
+
+    try:
+        scene_folder.relative_to(scene_root)
+    except ValueError:
+        return None, JsonResponse({
+            'status': 'error',
+            'message': '场景目录非法'
+        }, status=400)
+
+    if not scene_folder.exists() or not scene_folder.is_dir():
+        return None, JsonResponse({
+            'status': 'error',
+            'message': f'场景文件夹不存在: {scene.sceneName}'
+        }, status=404)
+
+    file_path = (scene_folder / file_name).resolve(strict=False)
+    try:
+        file_path.relative_to(scene_folder)
+    except ValueError:
+        return None, JsonResponse({
+            'status': 'error',
+            'message': '文件路径非法'
+        }, status=400)
+
+    if not file_path.exists() or not file_path.is_file():
+        return None, JsonResponse({
+            'status': 'error',
+            'message': f'文件不存在: {file_name}'
+        }, status=404)
+
+    try:
+        content = file_path.read_text(encoding='utf-8')
+    except UnicodeDecodeError:
+        content = file_path.read_text(encoding='utf-8', errors='replace')
+
+    return {
+        'status': 'success',
+        'sceneId': scene.id,
+        'sceneName': scene.sceneName,
+        'fileName': file_name,
+        'content': content
+    }, None
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_rx_power_log(request):
+    scene_id = request.GET.get('sceneId')
+    if not scene_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 sceneId 参数'
+        }, status=400)
+
+    result, error_response = _read_scene_text_file(scene_id, 'rx_power_log.txt')
+    if error_response:
+        return error_response
+    return JsonResponse(result, json_dumps_params={'ensure_ascii': False})
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_ospf_detected(request):
+    scene_id = request.GET.get('sceneId')
+    if not scene_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 sceneId 参数'
+        }, status=400)
+
+    result, error_response = _read_scene_text_file(scene_id, 'ospf_detected.txt')
+    if error_response:
+        return error_response
+    return JsonResponse(result, json_dumps_params={'ensure_ascii': False})
+
+
 selected_scene_name = None
 
 
