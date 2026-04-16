@@ -43,7 +43,6 @@ from pathlib import Path
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.http import JsonResponse, HttpResponse
-from django.template.loader import render_to_string
 from django.views.decorators.http import require_http_methods
 from .models import *
 from .forms import *
@@ -3229,6 +3228,96 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=1)
+def _get_exata_template_environment():
+    template_dir = Path(__file__).resolve().parent / 'templates'
+    return Environment(
+        loader=FileSystemLoader(str(template_dir)),
+        lstrip_blocks=True,
+    )
+
+
+def _build_sequential_id_map(objects):
+    return {obj.id: idx + 1 for idx, obj in enumerate(objects)}
+
+
+def _build_export_context(scene):
+    nodes = Node.objects.filter(sceneId=scene).order_by('id').prefetch_related('interfaces')
+    links = Link.objects.filter(sceneId=scene).order_by('id').select_related(
+        'sourceInterface',
+        'destinationInterface',
+        'sourceNodeId',
+        'destinationNodeId',
+        'subnet',
+    )
+    all_subnets = Subnet.objects.filter(
+        sceneId=scene,
+        subnetType=Subnet.SubnetTypeChoices.SUB,
+    ).order_by('id').prefetch_related('interfaces__node')
+    default_subnet = all_subnets.first()
+    subnets = all_subnets.exclude(id=default_subnet.id) if default_subnet else all_subnets
+
+    isolated_node_ids = []
+    if default_subnet:
+        isolated_node_ids = list(
+            Node.objects.filter(sceneId=scene, interfaces__subnet=default_subnet)
+            .order_by('id')
+            .distinct()
+            .values_list('id', flat=True)
+        )
+
+    node_id_map = _build_sequential_id_map(list(nodes))
+    link_id_map = _build_sequential_id_map(list(links))
+    subnet_id_map = _build_sequential_id_map(list(all_subnets))
+    channel_configs, _, primary_channel_name = _get_scene_channel_data(scene)
+    errors = Error.objects.filter(sceneId=scene).order_by('id')
+    has_app_data = Configuration.objects.filter(sceneId=scene).exists()
+    has_fault_data = LinkError.objects.filter(sceneId=scene).exists() or errors.exists()
+
+    return {
+        'scene': scene,
+        'simulation_duration': int((scene.endTime - scene.startTime).total_seconds()),
+        'num_nodes': nodes.count(),
+        'nodes': nodes,
+        'links': links,
+        'satellites': Node.objects.filter(sceneId=scene, nodeType='satellite').order_by('id'),
+        'normal_nodes': Node.objects.filter(sceneId=scene, nodeType='normalNode').order_by('id'),
+        'errors': errors,
+        'default_subnet': default_subnet,
+        'subnets': subnets,
+        'node_id_map': node_id_map,
+        'link_id_map': link_id_map,
+        'subnet_id_map': subnet_id_map,
+        'isolated_node_ids': [node_id_map[node_id] for node_id in isolated_node_ids],
+        'include_app_config': has_app_data,
+        'include_fault_config': has_fault_data,
+        'channel_configs': channel_configs,
+        'primary_channel_name': primary_channel_name,
+    }
+
+
+def _render_exata_config_content(export_context):
+    template = _get_exata_template_environment().get_template('exata/exata_config.template')
+    return template.render(export_context)
+
+
+def _build_link_txt_lines(links, node_id_map, link_id_map):
+    link_content = []
+    for link in links:
+        source_interface_ip = link.sourceInterface.interfaceIp if link.sourceInterface else ""
+        destination_interface_ip = link.destinationInterface.interfaceIp if link.destinationInterface else ""
+        line = (
+            f"{link_id_map[link.id]} -1 "
+            f"{node_id_map[link.sourceNodeId.id]} {node_id_map[link.destinationNodeId.id]} "
+            f"{link.sourceInterface.interfaceIndex if link.sourceInterface else ''} "
+            f"{link.destinationInterface.interfaceIndex if link.destinationInterface else ''} "
+            f"{source_interface_ip} {destination_interface_ip} "
+            f"{1 if link.linkType == '鏃犵嚎' else 2}\n"
+        )
+        link_content.append(line)
+    return link_content
+
+
 def generate_exata_config(request):
     try:
         scene_id = request.GET.get('sceneId')
@@ -3240,19 +3329,8 @@ def generate_exata_config(request):
         except Scene.DoesNotExist:
             return JsonResponse({'status': 'error', 'message': 'Scene not found'}, status=404)
 
-        # 计算仿真持续时间（分钟）
-        time_delta = scene.endTime - scene.startTime
-        simulation_duration = int(time_delta.total_seconds() // 60)  # 转换为整数分钟
-
-        # 准备模板数据
-        exata_config_data = {
-            'scene': scene,
-            'nodes': Node.objects.filter(sceneId=scene).prefetch_related('interfaces'),
-            'links': Link.objects.filter(sceneId=scene).select_related('sourceInterface', 'destinationInterface'),
-            'simulation_duration': simulation_duration  # 新增持续时间参数
-        }
-
-        config_content = render_to_string('exata/exata_config.template', exata_config_data)
+        export_context = _build_export_context(scene)
+        config_content = _render_exata_config_content(export_context)
 
         response = HttpResponse(config_content, content_type='text/plain')
         response['Content-Disposition'] = f'attachment; filename="{scene.sceneName}.config"'
@@ -3275,26 +3353,13 @@ def generate_link_file(request):
         if not scene_id:
             return HttpResponse('Error: Missing sceneId parameter', status=400)
 
-        # 获取指定场景的所有链路信息
-        links = Link.objects.filter(sceneId=scene_id)
-
-        # 准备 link.txt 文件内容
-        link_content = []
-        for link in links:
-            # 获取接口 IP 地址
-            source_interfaceIp = link.sourceInterface.interfaceIp if link.sourceInterface else ""
-            destination_interfaceIp = link.destinationInterface.interfaceIp if link.destinationInterface else ""
-
-            # 构建链路数据行
-            line = (
-                f"{link.id} -1 "
-                f"{link.sourceNodeId.id} {link.destinationNodeId.id} "
-                f"{link.sourceInterface.interfaceIndex if link.sourceInterface else ''} "
-                f"{link.destinationInterface.interfaceIndex if link.destinationInterface else ''} "
-                f"{source_interfaceIp} {destination_interfaceIp} "
-                f"{1 if link.linkType == '无线' else 2}\n"
-            )
-            link_content.append(line)
+        scene = get_object_or_404(Scene, id=scene_id)
+        export_context = _build_export_context(scene)
+        link_content = _build_link_txt_lines(
+            export_context['links'],
+            export_context['node_id_map'],
+            export_context['link_id_map'],
+        )
 
         # 将内容写入文件或返回给用户
         response = HttpResponse(content_type='text/plain')
@@ -3315,15 +3380,17 @@ def generate_orbit_file(request):
         if not scene_id:
             return HttpResponse('Error: Missing sceneId parameter', status=400)
 
-        # 获取指定场景的所有卫星节点
-        satellites = Node.objects.filter(sceneId=scene_id, nodeType='satellite')
+        scene = get_object_or_404(Scene, id=scene_id)
+        export_context = _build_export_context(scene)
+        satellites = export_context['satellites']
+        node_id_map = export_context['node_id_map']
 
         # 准备 orbit.txt 文件内容
         orbit_content = []
         for satellite in satellites:
             # 构建轨道数据行
             line = (
-                f"{satellite.id} "
+                f"{node_id_map[satellite.id]} "
                 f"{satellite.startTime.year} {satellite.startTime.month} {satellite.startTime.day} "
                 f"{satellite.startTime.hour} {satellite.startTime.minute} {satellite.startTime.second} "
                 f"{satellite.startTime.microsecond // 1000} "
@@ -3356,11 +3423,12 @@ def generate_node_file(request):
         if not scene_id:
             return HttpResponse('Error: Missing sceneId parameter', status=400)
 
-        # 获取指定场景的所有普通节点
-        nodes = Node.objects.filter(sceneId=scene_id, nodeType='normalNode').order_by('id')
+        scene = get_object_or_404(Scene, id=scene_id)
+        export_context = _build_export_context(scene)
+        nodes = export_context['normal_nodes']
 
         # 准备 node.txt 文件内容
-        node_content = _build_node_txt_lines(nodes)
+        node_content = _build_node_txt_lines(nodes, node_id_map=export_context['node_id_map'])
 
         # 将内容写入文件或返回给用户
         response = HttpResponse(content_type='text/plain')
@@ -3386,10 +3454,12 @@ def generate_fault_file(request):
         except Scene.DoesNotExist:
             return HttpResponse('Error: Scene not found', status=404)
 
-        # 获取指定场景的所有故障记录
-        errors = Error.objects.filter(sceneId=scene)
-
-        fault_content = _build_fault_txt_lines(scene, errors)
+        export_context = _build_export_context(scene)
+        fault_content = _build_fault_txt_lines(
+            scene,
+            export_context['errors'],
+            node_id_map=export_context['node_id_map'],
+        )
 
         # 将内容写入文件或返回给用户
         response = HttpResponse(content_type='text/plain')
@@ -3406,7 +3476,7 @@ def _build_fault_txt_lines(scene, errors, node_id_map=None):
     if node_id_map is None:
         node_id_map = {
             node.id: idx + 1
-            for idx, node in enumerate(Node.objects.filter(sceneId=scene))
+            for idx, node in enumerate(Node.objects.filter(sceneId=scene).order_by('id'))
         }
 
     fault_content = []
@@ -3577,82 +3647,20 @@ def download_all_files(request):
         except Exception as e:
             print(f"删除文件失败 {file_path}: {e}")
 
-    # 计算仿真持续时间
-    time_delta = scene.endTime - scene.startTime
-    simulation_duration = int(time_delta.total_seconds())
-
-    # 获取所有相关数据
-    links = Link.objects.filter(sceneId=scene).select_related('sourceInterface', 'destinationInterface')
-    nodes = Node.objects.filter(sceneId=scene).prefetch_related('interfaces')
-    satellites = Node.objects.filter(sceneId=scene, nodeType='satellite')
-    normal_nodes = Node.objects.filter(sceneId=scene, nodeType='normalNode')
-    errors = Error.objects.filter(sceneId=scene)
-    count = Node.objects.filter(sceneId=scene).count()
-    num_nodes = count
-    # 查找默认子网（假设名为"默认无线子网"）
-    default_subnet = Subnet.objects.filter(
-        sceneId=scene,
-    ).first()
-    # 收集孤立节点（没有链路的节点）
-    # 1. 获取所有属于默认子网的节点（孤立节点）
-    isolated_nodes = Node.objects.filter(
-        sceneId=scene,
-        interfaces__subnet=default_subnet
-    ).distinct()
-    # 获取孤立节点ID列表
-    isolated_node_ids = [node.id for node in isolated_nodes]
-
-    # 获取所有子网
-    all_subnets = Subnet.objects.filter(sceneId=scene, subnetType=Subnet.SubnetTypeChoices.SUB).prefetch_related(
-        'interfaces__node')
-    # 分离默认子网与其他子网，exata中默认子网不显示 云
-    subnets = all_subnets.exclude(id=default_subnet.id if default_subnet else None)
-    # 判断是否需要写 .app 文件，与故障同理。
-    has_app_data = Configuration.objects.filter(sceneId=scene).exists()
-    # 判断是否需要写 .fault 文件，如果没有故障，不要往config里写入，不然会报错。
-    has_fault_data = LinkError.objects.filter(sceneId=scene).exists() or Error.objects.filter(sceneId=scene).exists()
-    # 节点 ID 映射
-    node_id_map = {node.id: idx + 1 for idx, node in enumerate(nodes)}
-    # 链路 ID 映射
-    link_id_map = {link.id: idx + 1 for idx, link in enumerate(links)}
-    # 子网 ID 映射（包含 default_subnet + 其他 subnets）
-    all_subnets_for_mapping = [s for s in all_subnets]  # QuerySet 转 list，保证顺序
-    subnet_id_map = {subnet.id: idx + 1 for idx, subnet in enumerate(all_subnets_for_mapping)}
-    # 转换成映射后的 id 列表,用来往子网写入
-    isolated_node_ids_mapped = [node_id_map[nid] for nid in isolated_node_ids]
+    export_context = _build_export_context(scene)
+    links = export_context['links']
+    satellites = export_context['satellites']
+    normal_nodes = export_context['normal_nodes']
+    errors = export_context['errors']
+    node_id_map = export_context['node_id_map']
+    link_id_map = export_context['link_id_map']
+    subnet_id_map = export_context['subnet_id_map']
+    has_app_data = export_context['include_app_config']
+    has_fault_data = export_context['include_fault_config']
     print(node_id_map)
     print(link_id_map)
     print(subnet_id_map)
-    channel_configs, _, primary_channel_name = _get_scene_channel_data(scene)
-    # 准备模板数据
-    exata_config_data = {
-        'scene': scene,
-        'num_nodes': num_nodes,
-        'nodes': nodes,
-        'links': links,
-        'simulation_duration': simulation_duration,
-        'default_subnet': default_subnet,
-        'subnets': subnets,
-        # 'isolated_node_ids': isolated_node_ids,
-        'isolated_node_ids': isolated_node_ids_mapped,
-        "include_app_config": has_app_data,
-        "include_fault_config": has_fault_data,
-        "node_id_map": node_id_map,
-        "link_id_map": link_id_map,
-        "channel_configs": channel_configs,
-        "primary_channel_name": primary_channel_name,
-    }
-
-    # # 生成 Exata 配置文件内容
-    # exata_config_content = render_to_string('exata/exata_config.template', exata_config_data)
-
-    # 假设你的模板在 templates/exata/ 目录下,使用jinja2模板
-    TEMPLATE_DIR = Path(__file__).resolve().parent / 'templates'
-    env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)),
-    lstrip_blocks=True)
-    template = env.get_template('exata/exata_config.template')
-
-    exata_config_content = template.render(exata_config_data)
+    exata_config_content = _render_exata_config_content(export_context)
     # 保存到文件
     config_path = os.path.join(scene_folder, f"{scene.sceneName}.config")
     with open(config_path, 'w', encoding='utf-8') as f:
@@ -3687,7 +3695,12 @@ def download_all_files(request):
 
     if has_fault_data:
         # 生成并保存 .fault 文件
-        fault_content = generate_scene_fault_content(scene,node_id_map)
+        fault_content = generate_scene_fault_content(
+            scene,
+            node_id_map,
+            link_id_map=link_id_map,
+            subnet_id_map=subnet_id_map,
+        )
         fault_path = os.path.join(scene_folder, f"{scene.sceneName}.fault")
         with open(fault_path, 'w', encoding='utf-8') as f:
             f.write(fault_content)
@@ -3756,19 +3769,7 @@ def download_all_files(request):
         f.writelines(slot_table_data)
 
     # 生成并保存 link.txt 文件
-    link_content = []
-    for link in links:
-        source_interfaceIp = link.sourceInterface.interfaceIp if link.sourceInterface else ""
-        destination_interfaceIp = link.destinationInterface.interfaceIp if link.destinationInterface else ""
-        line = (
-            f"{link.id} -1 "
-            f"{node_id_map[link.sourceNodeId.id]} {node_id_map[link.destinationNodeId.id]} "
-            f"{link.sourceInterface.interfaceIndex if link.sourceInterface else ''} "
-            f"{link.destinationInterface.interfaceIndex if link.destinationInterface else ''} "
-            f"{source_interfaceIp} {destination_interfaceIp} "
-            f"{1 if link.linkType == '无线' else 2}\n"
-        )
-        link_content.append(line)
+    link_content = _build_link_txt_lines(links, node_id_map, link_id_map)
 
     link_path = os.path.join(scene_folder, "link.txt")
     with open(link_path, 'w', encoding='utf-8') as f:
@@ -4007,13 +4008,39 @@ def generate_scene_nodes_content(scene,node_id_map):
     return content
 
 
-def generate_scene_fault_content(scene,node_id_map):
+def generate_scene_fault_content(scene, node_id_map, link_id_map=None, subnet_id_map=None):
     result = []
+
+    if link_id_map is None:
+        ordered_links = list(Link.objects.filter(sceneId=scene).order_by('id'))
+        link_id_map = _build_sequential_id_map(ordered_links)
+
+    if subnet_id_map is None:
+        ordered_subnets = list(
+            Subnet.objects.filter(
+                sceneId=scene,
+                subnetType=Subnet.SubnetTypeChoices.SUB,
+            ).order_by('id')
+        )
+        subnet_id_map = _build_sequential_id_map(ordered_subnets)
 
     def seconds_since_scene_start(time_point):
         if not time_point:
             return "0S"
         return f"{int((time_point - scene.startTime).total_seconds())}S"
+
+    def get_interface_export_id(iface):
+        iface_type = iface.interfaceType.upper()
+        if iface_type == "SUB":
+            subnet_export_id = subnet_id_map.get(iface.subnet.id) if iface.subnet else None
+            return f"SUB{subnet_export_id or 0}"
+        if iface_type == "LINK":
+            link = Link.objects.filter(
+                Q(sourceInterface=iface) | Q(destinationInterface=iface)
+            ).first()
+            link_export_id = link_id_map.get(link.id) if link else None
+            return f"LINK{link_export_id or 0}"
+        return "UNKNOWN"
 
     # 节点故障：根据是否指定接口来决定故障范围
     node_errors = Error.objects.filter(sceneId=scene)
@@ -4026,18 +4053,8 @@ def generate_scene_fault_content(scene,node_id_map):
         if error.interfaceId:
             # 单接口故障
             iface = error.interfaceId
-            iface_type = iface.interfaceType.upper()
             iface_index = iface.interfaceIndex
-
-            if iface_type == "SUB":
-                id_part = f"SUB{iface.subnet.id if iface.subnet else 0}"
-            elif iface_type == "LINK":
-                link = Link.objects.filter(
-                    Q(sourceInterface=iface) | Q(destinationInterface=iface)
-                ).first()
-                id_part = f"LINK{link.id}" if link else "LINK0"
-            else:
-                id_part = "UNKNOWN"
+            id_part = get_interface_export_id(iface)
 
             line = f"INTERFACE-FAULT {id_part}/{node_id_map[node.id]}/{iface_index} {start_time} {end_time} NO"
             result.append(line)
@@ -4045,18 +4062,8 @@ def generate_scene_fault_content(scene,node_id_map):
             # 整个节点故障：写所有接口的故障
             interfaces = Interface.objects.filter(node=node)
             for iface in interfaces:
-                iface_type = iface.interfaceType.upper()
                 iface_index = iface.interfaceIndex
-
-                if iface_type == "SUB":
-                    id_part = f"SUB{iface.subnet.id if iface.subnet else 0}"
-                elif iface_type == "LINK":
-                    link = Link.objects.filter(
-                        Q(sourceInterface=iface) | Q(destinationInterface=iface)
-                    ).first()
-                    id_part = f"LINK{link.id}" if link else "LINK0"
-                else:
-                    id_part = "UNKNOWN"
+                id_part = get_interface_export_id(iface)
 
                 line = f"INTERFACE-FAULT {id_part}/{node_id_map[node.id]}/{iface_index} {start_time} {end_time} NO"
                 result.append(line)
@@ -4075,7 +4082,7 @@ def generate_scene_fault_content(scene,node_id_map):
             node = iface.node
             iface_type = iface.interfaceType.upper()
             iface_index = iface.interfaceIndex
-            link_id = link.id
+            link_id = link_id_map.get(link.id, link.id)
             mapped_node_id = node_id_map.get(node.id, node.id)
             line = f"INTERFACE-FAULT {iface_type}{link_id}/{mapped_node_id}/{iface_index} {start_time} {end_time} NO"
             result.append(line)

@@ -63,3 +63,21 @@
     - `广播业务` -> `MESSENGER-APP <src> <dest> <transport_type> <app_type> <life_time> <start_time> <interval> <fragment_size> <fragment_num>`
     - `组播业务` -> `MCBR <src> <multicast-destination> <items-to-send> <item-size> <interval> <start-time> <end-time>`
   - 新增文档：`doc/configuration_api.md`
+
+- **导出文件中的链路/子网 ID 改为连续映射**
+  - 导出层不再直接写入数据库主键 `link.id` / `subnet.id`，改为按主键升序映射到连续的 `1..N`
+  - 在 `api/views.py` 中新增统一导出上下文 helper，集中生成 `node_id_map`、`link_id_map`、`subnet_id_map`
+  - `generate_exata_config`、`generate_link_file`、`generate_orbit_file`、`generate_node_file`、`generate_fault_file`、`download_all_files` 统一复用这套映射逻辑
+  - `api/templates/exata/exata_config.template` 中所有 `SUB...` / `LINK...` 标识改为使用映射后的连续编号
+  - 场景 `.fault` 与 `link.txt` 同步改为使用映射后的链路/子网编号，保证与 `.config` 一致
+  - 前端 CRUD 与查询接口仍然返回真实数据库主键，本次仅调整导出文件中的仿真编号
+  - 提交说明：`refactor: map exported link and subnet ids sequentially`
+
+- **导出文件的链路/子网 ID 改为连续映射**
+  - 不再直接使用数据库主键 `link.id` / `subnet.id` 写入导出文件，改为按数据库 `id` 升序映射到连续编号 `1..N`
+  - 在 `api/views.py` 新增统一导出上下文 helper，集中生成 `node_id_map`、`link_id_map`、`subnet_id_map`
+  - `generate_exata_config`、`generate_link_file`、`download_all_files` 统一复用同一套映射逻辑
+  - `api/templates/exata/exata_config.template` 中所有 `SUB...` / `LINK...` 标识都改为使用映射后的连续编号
+  - 场景 `.fault` 和 `link.txt` 也同步改为使用映射后的链路/子网编号，保证与 `.config` 一致
+  - 前端 CRUD 与查询接口仍返回真实数据库主键，仅导出文件使用连续编号
+  - 提交说明：`refactor: map exported link and subnet ids sequentially`
