@@ -1,6 +1,21 @@
 from rest_framework import serializers
 from .models import Configuration
 
+
+def _parse_duration_seconds(value):
+    if value in [None, '']:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip().upper()
+    if text.endswith('MS'):
+        return float(text[:-2]) / 1000
+    if text.endswith('S'):
+        return float(text[:-1])
+    return float(text)
+
+
 class ConfigurationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Configuration
@@ -60,12 +75,59 @@ class ConfigurationSerializer(serializers.ModelSerializer):
             if not isinstance(server_list, list) or not server_list:
                 raise serializers.ValidationError("HTTP 类型必须提供非空的 serverList 列表。")
 
+        elif business_type == '泊松分布':
+            required_fields = ['sourceNodeId', 'destinationNodeId', 'poissonStartTime', 'poissonEndTime', 'poissonMeanInterval', 'poissonPacketSize']
+            start_time = data.get('poissonStartTime')
+            end_time = data.get('poissonEndTime')
+
+            if not data.get('sourceNodeId') or not data.get('destinationNodeId'):
+                raise serializers.ValidationError("泊松分布类型需要指定 sourceNodeId 和 destinationNodeId。")
+
+        elif business_type == '广播业务':
+            required_fields = [
+                'sourceNodeId',
+                'broadcastDest',
+                'broadcastTransportType',
+                'broadcastAppType',
+                'broadcastLifeTime',
+                'broadcastStartTime',
+                'broadcastInterval',
+                'broadcastFragmentSize',
+                'broadcastFragmentNum',
+            ]
+            start_time = data.get('broadcastStartTime')
+            end_time = None
+
+            if not data.get('sourceNodeId'):
+                raise serializers.ValidationError("广播业务类型需要指定 sourceNodeId。")
+
+        elif business_type == '组播业务':
+            required_fields = [
+                'sourceNodeId',
+                'multicastDestination',
+                'multicastItemsToSend',
+                'multicastItemSize',
+                'multicastInterval',
+                'multicastStartTime',
+                'multicastEndTime',
+            ]
+            start_time = data.get('multicastStartTime')
+            end_time = data.get('multicastEndTime')
+
+            if not data.get('sourceNodeId'):
+                raise serializers.ValidationError("组播业务类型需要指定 sourceNodeId。")
+
         else:
             raise serializers.ValidationError(f"不支持的业务类型: {business_type}")
 
         # 检查时间合理性（如果有结束时间）
-        if start_time and end_time and start_time >= end_time:
-            raise serializers.ValidationError("开始时间必须早于结束时间。")
+        if start_time and end_time:
+            try:
+                if _parse_duration_seconds(start_time) >= _parse_duration_seconds(end_time):
+                    raise serializers.ValidationError("开始时间必须早于结束时间。")
+            except (TypeError, ValueError):
+                if start_time >= end_time:
+                    raise serializers.ValidationError("开始时间必须早于结束时间。")
 
         # 检查必填字段是否存在
         missing_fields = [field for field in required_fields if data.get(field) in [None, '']]

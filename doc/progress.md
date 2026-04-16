@@ -53,3 +53,12 @@
   - 新增迁移文件：`0017_error_interfaceid_scene_channelconfigs_and_more.py`
 
 - 本地提交：`f388bf9` (主要功能), `8db5bb6` (文档更新)
+
+- **新增业务类型与 `.app` 导出**
+  - `Configuration` 新增 3 类业务：`泊松分布`、`广播业务`、`组播业务`
+  - 新增对应配置字段、列表返回字段、创建校验与编辑分支
+  - `.app` 生成逻辑已支持导出以下 EXATA 格式：
+    - `泊松分布` -> `VBR <src> <dest> <packet_size> <mean_interval> <start_time> <end_time>`
+    - `广播业务` -> `MESSENGER-APP <src> <dest> <transport_type> <app_type> <life_time> <start_time> <interval> <fragment_size> <fragment_num>`
+    - `组播业务` -> `MCBR <src> <multicast-destination> <items-to-send> <item-size> <interval> <start-time> <end-time>`
+  - 新增文档：`doc/configuration_api.md`

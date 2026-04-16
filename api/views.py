@@ -1711,6 +1711,24 @@ def get_configuration_list(request):
         'serverList': config.serverList,
         'httpStartTime': config.httpStartTime,
         'httpThreshTime': config.httpThreshTime,
+        'poissonStartTime': config.poissonStartTime,
+        'poissonEndTime': config.poissonEndTime,
+        'poissonMeanInterval': config.poissonMeanInterval,
+        'poissonPacketSize': config.poissonPacketSize,
+        'broadcastDest': config.broadcastDest,
+        'broadcastTransportType': config.broadcastTransportType,
+        'broadcastAppType': config.broadcastAppType,
+        'broadcastLifeTime': config.broadcastLifeTime,
+        'broadcastStartTime': config.broadcastStartTime,
+        'broadcastInterval': config.broadcastInterval,
+        'broadcastFragmentSize': config.broadcastFragmentSize,
+        'broadcastFragmentNum': config.broadcastFragmentNum,
+        'multicastDestination': config.multicastDestination,
+        'multicastItemsToSend': config.multicastItemsToSend,
+        'multicastItemSize': config.multicastItemSize,
+        'multicastInterval': config.multicastInterval,
+        'multicastStartTime': config.multicastStartTime,
+        'multicastEndTime': config.multicastEndTime,
         'businessType': config.businessType
     } for config in page_obj]
 
@@ -1776,6 +1794,30 @@ def edit_configuration_list(request, configuration_id):
 
         config.httpStartTime = data.get('httpStartTime', config.httpStartTime)
         config.httpThreshTime = data.get('httpThreshTime', config.httpThreshTime)
+
+    elif business_type == '泊松分布':
+        config.poissonStartTime = data.get('poissonStartTime', config.poissonStartTime)
+        config.poissonEndTime = data.get('poissonEndTime', config.poissonEndTime)
+        config.poissonMeanInterval = data.get('poissonMeanInterval', config.poissonMeanInterval)
+        config.poissonPacketSize = data.get('poissonPacketSize', config.poissonPacketSize)
+
+    elif business_type == '广播业务':
+        config.broadcastDest = data.get('broadcastDest', config.broadcastDest)
+        config.broadcastTransportType = data.get('broadcastTransportType', config.broadcastTransportType)
+        config.broadcastAppType = data.get('broadcastAppType', config.broadcastAppType)
+        config.broadcastLifeTime = data.get('broadcastLifeTime', config.broadcastLifeTime)
+        config.broadcastStartTime = data.get('broadcastStartTime', config.broadcastStartTime)
+        config.broadcastInterval = data.get('broadcastInterval', config.broadcastInterval)
+        config.broadcastFragmentSize = data.get('broadcastFragmentSize', config.broadcastFragmentSize)
+        config.broadcastFragmentNum = data.get('broadcastFragmentNum', config.broadcastFragmentNum)
+
+    elif business_type == '组播业务':
+        config.multicastDestination = data.get('multicastDestination', config.multicastDestination)
+        config.multicastItemsToSend = data.get('multicastItemsToSend', config.multicastItemsToSend)
+        config.multicastItemSize = data.get('multicastItemSize', config.multicastItemSize)
+        config.multicastInterval = data.get('multicastInterval', config.multicastInterval)
+        config.multicastStartTime = data.get('multicastStartTime', config.multicastStartTime)
+        config.multicastEndTime = data.get('multicastEndTime', config.multicastEndTime)
 
     config.save()
 
@@ -3826,6 +3868,33 @@ def generate_scene_app_content(scene,node_id_map):
             if config.serverList:
                 for server_id in config.serverList:
                     content += f"HTTPD {node_id_map[server_id]}\n"
+
+        elif config.businessType == '泊松分布':
+            config_line = (
+                f"VBR {node_id_map[config.sourceNodeId.id]} "
+                f"{node_id_map[config.destinationNodeId.id]} {config.poissonPacketSize} "
+                f"{config.poissonMeanInterval} {config.poissonStartTime} {config.poissonEndTime}\n"
+            )
+            content += config_line
+
+        elif config.businessType == '广播业务':
+            config_line = (
+                f"MESSENGER-APP {node_id_map[config.sourceNodeId.id]} {config.broadcastDest} "
+                f"{config.broadcastTransportType} {config.broadcastAppType} "
+                f"{config.broadcastLifeTime} {config.broadcastStartTime} "
+                f"{config.broadcastInterval} {config.broadcastFragmentSize} "
+                f"{config.broadcastFragmentNum}\n"
+            )
+            content += config_line
+
+        elif config.businessType == '组播业务':
+            config_line = (
+                f"MCBR {node_id_map[config.sourceNodeId.id]} {config.multicastDestination} "
+                f"{config.multicastItemsToSend} {config.multicastItemSize} "
+                f"{config.multicastInterval} {config.multicastStartTime} "
+                f"{config.multicastEndTime}\n"
+            )
+            content += config_line
 
     return content
 

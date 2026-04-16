@@ -160,6 +160,9 @@ class Configuration(models.Model):
         ('FTP', 'FTP'),
         ('TRAFFIC-GEN', 'TRAFFIC-GEN'),
         ('HTTP', 'HTTP'),
+        ('泊松分布', '泊松分布'),
+        ('广播业务', '广播业务'),
+        ('组播业务', '组播业务'),
     )
 
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='configurations', default=12)
@@ -211,6 +214,30 @@ class Configuration(models.Model):
     )
     httpStartTime = models.FloatField(null=True, blank=True, verbose_name='HTTP开始时间（s）')
     httpThreshTime = models.FloatField(null=True, blank=True, verbose_name='HTTP阈值时间（s）')
+
+    # ========== 泊松分布配置 ==========
+    poissonStartTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='泊松分布开始时间')
+    poissonEndTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='泊松分布结束时间')
+    poissonMeanInterval = models.CharField(max_length=50, null=True, blank=True, verbose_name='平均发包间隔')
+    poissonPacketSize = models.IntegerField(null=True, blank=True, verbose_name='发送包大小')
+
+    # ========== 广播业务配置 ==========
+    broadcastDest = models.CharField(max_length=255, null=True, blank=True, verbose_name='广播目的地址')
+    broadcastTransportType = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播传输类型')
+    broadcastAppType = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播应用类型')
+    broadcastLifeTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播生命周期')
+    broadcastStartTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播启动时间')
+    broadcastInterval = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播发送间隔')
+    broadcastFragmentSize = models.IntegerField(null=True, blank=True, verbose_name='广播分片大小')
+    broadcastFragmentNum = models.IntegerField(null=True, blank=True, verbose_name='广播分片数量')
+
+    # ========== 组播业务配置 ==========
+    multicastDestination = models.CharField(max_length=255, null=True, blank=True, verbose_name='组播目的地址')
+    multicastItemsToSend = models.IntegerField(null=True, blank=True, verbose_name='组播发送报文总数')
+    multicastItemSize = models.IntegerField(null=True, blank=True, verbose_name='组播单报文大小')
+    multicastInterval = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播发送间隔')
+    multicastStartTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播启动时间')
+    multicastEndTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播结束时间')
 
     def __str__(self):
         return f'{self.businessType} - {self.businessName}'
