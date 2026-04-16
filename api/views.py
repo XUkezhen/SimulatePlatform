@@ -65,6 +65,9 @@ import glob
 from typing import List, Dict, Tuple
 from django.conf import settings
 from jinja2 import Environment, FileSystemLoader
+from .network_layer_data import find_bellmanford_files, get_block_by_sim_time, parse_bellmanford_file
+from .物理层数据采集2 import extract_config_parameters
+from .链路层数据采集 import process_link_relationships
 
 @require_http_methods(["POST"])
 @csrf_exempt
@@ -4339,6 +4342,61 @@ def _read_scene_text_file(scene_id, file_name):
     }, None
 
 
+def _get_scene_folder(scene_id):
+    try:
+        scene = Scene.objects.get(id=scene_id)
+    except Scene.DoesNotExist:
+        return None, None, JsonResponse({
+            'status': 'error',
+            'message': f'场景ID {scene_id} 不存在'
+        }, status=404)
+
+    scene_folder = (_get_scene_files_root() / scene.sceneName).resolve(strict=False)
+    scene_root = _get_scene_files_root().resolve(strict=False)
+
+    try:
+        scene_folder.relative_to(scene_root)
+    except ValueError:
+        return None, None, JsonResponse({
+            'status': 'error',
+            'message': '场景目录非法'
+        }, status=400)
+
+    if not scene_folder.exists() or not scene_folder.is_dir():
+        return None, None, JsonResponse({
+            'status': 'error',
+            'message': f'场景文件夹不存在: {scene.sceneName}'
+        }, status=404)
+
+    return scene, scene_folder, None
+
+
+def _resolve_scene_data_file(scene_folder, scene_name, suffix):
+    preferred_file = (scene_folder / f'{scene_name}{suffix}').resolve(strict=False)
+    if preferred_file.exists() and preferred_file.is_file():
+        return preferred_file, None
+
+    matched_files = sorted(
+        path.resolve(strict=False)
+        for path in scene_folder.glob(f'*{suffix}')
+        if path.is_file()
+    )
+
+    if not matched_files:
+        return None, JsonResponse({
+            'status': 'error',
+            'message': f'未找到 {suffix} 文件'
+        }, status=404)
+
+    if len(matched_files) > 1:
+        return None, JsonResponse({
+            'status': 'error',
+            'message': f'场景目录下存在多个 {suffix} 文件，请保留唯一文件后再重试'
+        }, status=400)
+
+    return matched_files[0], None
+
+
 @require_http_methods(["GET"])
 @csrf_exempt
 def get_rx_power_log(request):
@@ -4369,6 +4427,183 @@ def get_ospf_detected(request):
     if error_response:
         return error_response
     return JsonResponse(result, json_dumps_params={'ensure_ascii': False})
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_physical_layer_data(request):
+    scene_id = request.GET.get('sceneId')
+    if not scene_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 sceneId 参数'
+        }, status=400)
+
+    scene, scene_folder, error_response = _get_scene_folder(scene_id)
+    if error_response:
+        return error_response
+
+    config_file, error_response = _resolve_scene_data_file(scene_folder, scene.sceneName, '.config')
+    if error_response:
+        return error_response
+
+    try:
+        result = extract_config_parameters(str(config_file))
+    except Exception as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'物理层数据采集失败: {str(e)}'
+        }, status=500)
+
+    return JsonResponse({
+        'status': 'success',
+        'sceneId': scene.id,
+        'sceneName': scene.sceneName,
+        'configFile': config_file.name,
+        'data': result
+    }, json_dumps_params={'ensure_ascii': False})
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_link_layer_data(request):
+    scene_id = request.GET.get('sceneId')
+    if not scene_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 sceneId 参数'
+        }, status=400)
+
+    scene, scene_folder, error_response = _get_scene_folder(scene_id)
+    if error_response:
+        return error_response
+
+    config_file, error_response = _resolve_scene_data_file(scene_folder, scene.sceneName, '.config')
+    if error_response:
+        return error_response
+
+    nodes_file, error_response = _resolve_scene_data_file(scene_folder, scene.sceneName, '.nodes')
+    if error_response:
+        return error_response
+
+    try:
+        result = process_link_relationships(str(config_file), str(nodes_file))
+    except Exception as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'链路层数据采集失败: {str(e)}'
+        }, status=500)
+
+    return JsonResponse({
+        'status': 'success',
+        'sceneId': scene.id,
+        'sceneName': scene.sceneName,
+        'configFile': config_file.name,
+        'nodesFile': nodes_file.name,
+        'data': result
+    }, json_dumps_params={'ensure_ascii': False})
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_network_layer_data(request):
+    scene_id = request.GET.get('sceneId')
+    if not scene_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 sceneId 参数'
+        }, status=400)
+
+    scene, scene_folder, error_response = _get_scene_folder(scene_id)
+    if error_response:
+        return error_response
+
+    node_files = find_bellmanford_files(scene_folder)
+    if not node_files:
+        return JsonResponse({
+            'status': 'error',
+            'message': '未找到 bellmanford_node_*.txt 文件'
+        }, status=404)
+
+    data = []
+    for node_id, file_path in node_files:
+        parsed = parse_bellmanford_file(file_path)
+        data.append({
+            'nodeId': node_id,
+            'nodeName': parsed['nodeLabel'],
+            'times': [block['simTime'] for block in parsed['blocks']],
+        })
+
+    return JsonResponse({
+        'status': 'success',
+        'sceneId': scene.id,
+        'sceneName': scene.sceneName,
+        'data': data
+    }, json_dumps_params={'ensure_ascii': False})
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_network_layer_block(request):
+    scene_id = request.GET.get('sceneId')
+    node_id = request.GET.get('nodeId')
+    sim_time = request.GET.get('simTime')
+
+    if not scene_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 sceneId 参数'
+        }, status=400)
+
+    if not node_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 nodeId 参数'
+        }, status=400)
+
+    if not sim_time:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 simTime 参数'
+        }, status=400)
+
+    try:
+        node_id = int(node_id)
+    except (TypeError, ValueError):
+        return JsonResponse({
+            'status': 'error',
+            'message': 'nodeId 参数格式错误'
+        }, status=400)
+
+    scene, scene_folder, error_response = _get_scene_folder(scene_id)
+    if error_response:
+        return error_response
+
+    node_files = dict(find_bellmanford_files(scene_folder))
+    file_path = node_files.get(node_id)
+    if file_path is None:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'未找到节点{node_id}对应的 bellmanford 文件'
+        }, status=404)
+
+    result = get_block_by_sim_time(file_path, sim_time)
+    if result is None:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'节点{node_id}下未找到 simTime={sim_time} 的数据块'
+        }, status=404)
+
+    block = result['block']
+    return JsonResponse({
+        'status': 'success',
+        'sceneId': scene.id,
+        'sceneName': scene.sceneName,
+        'nodeId': result['nodeId'],
+        'nodeName': result['nodeLabel'],
+        'simTime': block['simTime'],
+        'block': block['rawBlock']
+    }, json_dumps_params={'ensure_ascii': False})
 
 
 selected_scene_name = None
