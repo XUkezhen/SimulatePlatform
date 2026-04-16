@@ -24,4 +24,4 @@ ECHO ---------------------------------------------------
 REM --- 直接调用 daphne，不再使用 start 命令 ---
 REM !!! (可能需要修改) 如果daphne不在系统路径中，请使用完整路径 !!!
 REM 例如: C:\path\to\your\venv\Scripts\daphne.exe -b 0.0.0.0 ...
-daphne -b 0.0.0.0 -p 8000 mytest.asgi:application
+python -m daphne -b 0.0.0.0 -p 8001 mytest.asgi:application
