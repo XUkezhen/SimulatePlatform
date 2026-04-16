@@ -83,6 +83,8 @@ def add_scene_list(request):
         start_time_str = data.get('startTime')
         end_time_str = data.get('endTime')
         simulation_step = data.get('simulationStep')
+        channel_count = data.get('channelCount', 0)
+        channel_configs = data.get('channelConfigs', [])
     except json.JSONDecodeError:
         return JsonResponse({
             'status': 'error',
@@ -117,13 +119,41 @@ def add_scene_list(request):
             'message': 'simulationStep must be a positive integer'
         }, status=400)
 
+    # 验证信道配置
+    try:
+        channel_count = int(channel_count) if channel_count else 0
+        if channel_count < 0:
+            return JsonResponse({
+                'status': 'error',
+                'message': 'channelCount must be a non-negative integer'
+            }, status=400)
+    except (ValueError, TypeError):
+        return JsonResponse({
+            'status': 'error',
+            'message': 'channelCount must be an integer'
+        }, status=400)
+
+    if channel_configs and not isinstance(channel_configs, list):
+        return JsonResponse({
+            'status': 'error',
+            'message': 'channelConfigs must be an array'
+        }, status=400)
+
+    if channel_count > 0 and len(channel_configs) != channel_count:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'channelConfigs length ({len(channel_configs)}) must match channelCount ({channel_count})'
+        }, status=400)
+
     try:
         # 创建场景对象
         scene = Scene.objects.create(
             sceneName=scene_name,
             startTime=start_time,
             endTime=end_time,
-            simulationStep=simulation_step
+            simulationStep=simulation_step,
+            channelCount=channel_count,
+            channelConfigs=channel_configs
         )
 
         # 创建默认子网
@@ -204,6 +234,8 @@ def edit_scene_list(request, scene_id):
         new_start_time = data.get('startTime', scene.startTime)
         new_end_time = data.get('endTime', scene.endTime)
         new_simulation_step = int(data.get('simulationStep', scene.simulationStep))
+        new_channel_count = data.get('channelCount', scene.channelCount)
+        new_channel_configs = data.get('channelConfigs', scene.channelConfigs)
 
         # 验证场景名称是否重复
         if Scene.objects.exclude(id=scene_id).filter(sceneName=new_scene_name).exists():
@@ -213,11 +245,28 @@ def edit_scene_list(request, scene_id):
         if new_start_time >= new_end_time:
             return JsonResponse({'status': 'error', 'message': '开始时间必须早于结束时间'}, status=400)
 
+        # 验证信道配置
+        if new_channel_count is not None:
+            try:
+                new_channel_count = int(new_channel_count)
+                if new_channel_count < 0:
+                    return JsonResponse({'status': 'error', 'message': 'channelCount must be a non-negative integer'}, status=400)
+            except (ValueError, TypeError):
+                return JsonResponse({'status': 'error', 'message': 'channelCount must be an integer'}, status=400)
+
+        if new_channel_configs is not None:
+            if not isinstance(new_channel_configs, list):
+                return JsonResponse({'status': 'error', 'message': 'channelConfigs must be an array'}, status=400)
+            if new_channel_count is not None and len(new_channel_configs) != new_channel_count:
+                return JsonResponse({'status': 'error', 'message': 'channelConfigs length must match channelCount'}, status=400)
+
         # 更新场景信息
         scene.sceneName = new_scene_name
         scene.startTime = new_start_time
         scene.endTime = new_end_time
         scene.simulationStep = new_simulation_step
+        scene.channelCount = new_channel_count
+        scene.channelConfigs = new_channel_configs
         scene.save()
 
         return JsonResponse({'status': 'success'})
@@ -251,7 +300,9 @@ def get_scene_list(request):
         'sceneName': scene.sceneName,
         'startTime': scene.startTime.isoformat(),
         'endTime': scene.endTime.isoformat(),
-        'simulationStep': scene.simulationStep
+        'simulationStep': scene.simulationStep,
+        'channelCount': scene.channelCount,
+        'channelConfigs': scene.channelConfigs
     } for scene in page_obj]
 
     # 返回分页后的场景列表
@@ -2396,6 +2447,7 @@ def add_node_error_list(request):
     node_id = data.get('nodeId')
     error_start_time = data.get('errorStartTime')
     error_end_time = data.get('errorEndTime')
+    interface_index = data.get('interfaceIndex')  # 可选接口序号
 
     # 查询 Scene 实例
     try:
@@ -2408,6 +2460,14 @@ def add_node_error_list(request):
         node = Node.objects.get(id=node_id)
     except Node.DoesNotExist:
         return JsonResponse({'status': 'error', 'message': '节点不存在'}, status=404)
+
+    # 根据接口序号查找接口（可选）
+    interface = None
+    if interface_index is not None:
+        try:
+            interface = Interface.objects.get(node_id=node_id, interfaceIndex=interface_index)
+        except Interface.DoesNotExist:
+            return JsonResponse({'status': 'error', 'message': f'节点下不存在接口序号 {interface_index}'}, status=404)
 
         # 将字符串转换为 datetime 对象
     if error_start_time:
@@ -2427,6 +2487,7 @@ def add_node_error_list(request):
     form = ErrorForm({
         'sceneId': scene_id,
         'nodeId': node_id,
+        'interfaceId': interface.id if interface else None,
         'errorStartTime': error_start_time,
         'errorEndTime': error_end_time,
     })
@@ -2462,7 +2523,8 @@ def get_node_error_list(request):
     scene_id = request.GET.get('sceneId', '')
     node_name = request.GET.get('nodeName', '')
     node_type = request.GET.get('nodeType', '')
-    node_id = request.GET.get('nodeId', '')  # 新增节点ID查询参数
+    node_id = request.GET.get('nodeId', '')  # 节点ID查询参数
+    interface_index = request.GET.get('interfaceIndex', '')  # 接口序号查询参数
     page_size = int(request.GET.get('size', 10))
     page_number = int(request.GET.get('page', 1))
 
@@ -2474,8 +2536,10 @@ def get_node_error_list(request):
         query &= Q(nodeId__nodeName__icontains=node_name)
     if node_type:
         query &= Q(nodeId__nodeType__icontains=node_type)
-    if node_id:  # 新增节点ID过滤条件
+    if node_id:  # 节点ID过滤条件
         query &= Q(nodeId__id=node_id)
+    if interface_index:  # 接口序号过滤条件
+        query &= Q(interfaceId__interfaceIndex=interface_index)
 
     # 获取查询结果并分页
     node_errors = Error.objects.filter(query).order_by('nodeId__nodeName')
@@ -2490,7 +2554,9 @@ def get_node_error_list(request):
         'nodeName': error.nodeId.nodeName,
         'nodeType': error.nodeId.nodeType,
         'errorStartTime': error.errorStartTime,
-        'errorEndTime': error.errorEndTime
+        'errorEndTime': error.errorEndTime,
+        'interfaceIndex': error.interfaceId.interfaceIndex if error.interfaceId else None,
+        'interfaceIp': str(error.interfaceId.interfaceIp) if error.interfaceId and error.interfaceId.interfaceIp else None,
     } for error in page_obj]
 
     return JsonResponse({
@@ -2504,8 +2570,42 @@ def get_node_error_list(request):
 
 
 '''
+
 链路故障表
 '''
+
+
+@require_http_methods(["GET"])
+def get_channel_names(request):
+    """
+    获取指定场景下所有信道名称
+    参数: sceneId
+    返回: channelNames 列表
+    """
+    scene_id = request.GET.get('sceneId')
+    if not scene_id:
+        return JsonResponse({'status': 'error', 'message': '缺少 sceneId 参数'}, status=400)
+
+    try:
+        scene = Scene.objects.get(id=scene_id)
+    except Scene.DoesNotExist:
+        return JsonResponse({'status': 'error', 'message': '场景不存在'}, status=404)
+
+    channel_names = []
+    channel_configs = scene.channelConfigs or []
+
+    for config in channel_configs:
+        # 查找 PROPAGATION-CHANNEL-NAME[*] 键
+        for key, value in config.items():
+            if key.startswith('PROPAGATION-CHANNEL-NAME'):
+                channel_names.append(value)
+                break
+
+    return JsonResponse({
+        'status': 'success',
+        'channelNames': channel_names,
+        'channelCount': len(channel_names)
+    })
 
 
 @require_http_methods(["POST"])
@@ -2720,6 +2820,7 @@ def edit_node_error_list(request, node_error_id):
     node_id = data.get('nodeId')
     error_start_time = data.get('errorStartTime')
     error_end_time = data.get('errorEndTime')
+    interface_index = data.get('interfaceIndex')  # 可选接口序号
 
     # 查询 NodeError 实例
     try:
@@ -2733,6 +2834,19 @@ def edit_node_error_list(request, node_error_id):
             node_error.nodeId = node
         except Node.DoesNotExist:
             return JsonResponse({'status': 'error', 'message': '节点不存在'}, status=404)
+
+    # 更新接口（可选）
+    if 'interfaceIndex' in data:
+        if interface_index is not None:
+            target_node_id = node_id if node_id else node_error.nodeId_id
+            try:
+                interface = Interface.objects.get(node_id=target_node_id, interfaceIndex=interface_index)
+                node_error.interfaceId = interface
+            except Interface.DoesNotExist:
+                return JsonResponse({'status': 'error', 'message': f'节点下不存在接口序号 {interface_index}'}, status=404)
+        else:
+            # 如果传入 null，则设为 None（整个节点故障）
+            node_error.interfaceId = None
 
     if error_start_time:
         try:
@@ -3235,19 +3349,23 @@ def _build_fault_txt_lines(scene, errors, node_id_map=None):
 
     fault_content = []
     for error in errors:
-        interfaces = Interface.objects.filter(node=error.nodeId)
-        if not interfaces:
-            continue
-
         start_time = (error.errorStartTime - scene.startTime).total_seconds()
         end_time = (error.errorEndTime - scene.startTime).total_seconds()
         exported_node_id = node_id_map.get(error.nodeId.id, error.nodeId.id)
 
-        for interface in interfaces:
-            line = (
-                f"{exported_node_id} {interface.interfaceIndex} {int(start_time)} {int(end_time)}\n"
-            )
+        # 如果指定了接口，只写该接口；否则写所有接口
+        if error.interfaceId:
+            # 单接口故障
+            line = f"{exported_node_id} {error.interfaceId.interfaceIndex} {int(start_time)} {int(end_time)}\n"
             fault_content.append(line)
+        else:
+            # 整个节点故障：写所有接口
+            interfaces = Interface.objects.filter(node=error.nodeId)
+            if not interfaces:
+                continue
+            for interface in interfaces:
+                line = f"{exported_node_id} {interface.interfaceIndex} {int(start_time)} {int(end_time)}\n"
+                fault_content.append(line)
 
     return fault_content
 
@@ -3805,16 +3923,17 @@ def generate_scene_fault_content(scene,node_id_map):
             return "0S"
         return f"{int((time_point - scene.startTime).total_seconds())}S"
 
-    # 节点故障：写出该节点所有接口的故障（使用 subnet_id 或 link_id）
+    # 节点故障：根据是否指定接口来决定故障范围
     node_errors = Error.objects.filter(sceneId=scene)
     for error in node_errors:
         node = error.nodeId
-        interfaces = Interface.objects.filter(node=node)
-
         start_time = seconds_since_scene_start(error.errorStartTime)
         end_time = seconds_since_scene_start(error.errorEndTime)
 
-        for iface in interfaces:
+        # 如果指定了接口，只写该接口的故障；否则写所有接口的故障
+        if error.interfaceId:
+            # 单接口故障
+            iface = error.interfaceId
             iface_type = iface.interfaceType.upper()
             iface_index = iface.interfaceIndex
 
@@ -3830,6 +3949,25 @@ def generate_scene_fault_content(scene,node_id_map):
 
             line = f"INTERFACE-FAULT {id_part}/{node_id_map[node.id]}/{iface_index} {start_time} {end_time} NO"
             result.append(line)
+        else:
+            # 整个节点故障：写所有接口的故障
+            interfaces = Interface.objects.filter(node=node)
+            for iface in interfaces:
+                iface_type = iface.interfaceType.upper()
+                iface_index = iface.interfaceIndex
+
+                if iface_type == "SUB":
+                    id_part = f"SUB{iface.subnet.id if iface.subnet else 0}"
+                elif iface_type == "LINK":
+                    link = Link.objects.filter(
+                        Q(sourceInterface=iface) | Q(destinationInterface=iface)
+                    ).first()
+                    id_part = f"LINK{link.id}" if link else "LINK0"
+                else:
+                    id_part = "UNKNOWN"
+
+                line = f"INTERFACE-FAULT {id_part}/{node_id_map[node.id]}/{iface_index} {start_time} {end_time} NO"
+                result.append(line)
 
     # 链路故障：只写链路的 sourceInterface 和 destinationInterface
     # 使用链路 id 替代 subnet_id

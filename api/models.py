@@ -27,6 +27,8 @@ class Scene(models.Model):
     startTime = models.DateTimeField()
     endTime = models.DateTimeField()
     simulationStep = models.IntegerField()  # 新增仿真步长字段
+    channelCount = models.IntegerField(default=0, verbose_name="信道数量")
+    channelConfigs = models.JSONField(null=True, blank=True, default=list, verbose_name="信道配置列表")
     COORDINATE_CHOICES = [
         ('CARTESIAN', 'Cartesian'),#大写是写入数据库的，小写是展示用的
         ('LATLONALT', 'LatLonAlt'),
@@ -390,6 +392,14 @@ class Error(models.Model):
     nodeId = models.ForeignKey(Node, on_delete=models.CASCADE, related_name='errors')
     errorStartTime = models.DateTimeField(null=True, blank=True, default=timezone.now)
     errorEndTime = models.DateTimeField(null=True, blank=True, default=timezone.now)
+    interfaceId = models.ForeignKey(
+        'Interface',
+        on_delete=models.CASCADE,
+        related_name='errors',
+        null=True,
+        blank=True,
+        verbose_name="接口ID"
+    )
 
 class LinkError(models.Model):
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='linkerrors', default=12)

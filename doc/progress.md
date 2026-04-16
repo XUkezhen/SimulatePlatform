@@ -29,3 +29,27 @@
 - 改动：
 - 本地提交：
 - 备注：
+
+## 2026-04-16
+
+- **场景表添加信道配置**
+  - Scene 模型新增 `channelCount`（信道数量）和 `channelConfigs`（信道配置列表，JSONField）字段
+  - 场景 API 支持：创建、编辑、查询场景时传递信道配置参数
+  - 新增接口：`GET /api/getChannelNames?sceneId=xxx` 获取场景下所有信道名称
+
+- **节点故障添加接口选择**
+  - Error 模型新增 `interfaceId` 字段（可选外键，关联 Interface）
+  - 节点故障 API 改用 `interfaceIndex`（接口序号）而非接口ID
+  - 创建/编辑节点故障时，可指定具体接口序号；不指定则表示整个节点故障
+  - 故障文件生成逻辑适配：指定接口只写该接口故障，不指定写所有接口故障
+
+- **文件改动**
+  - `api/models.py`: Scene 和 Error 模型新增字段
+  - `api/forms.py`: SceneForm 和 ErrorForm 添加字段验证
+  - `api/views.py`: 场景/故障视图函数、故障文件生成函数、新增 get_channel_names
+  - `api/urls.py`: 新增路由
+
+- **数据库迁移**
+  - 新增迁移文件：`0017_error_interfaceid_scene_channelconfigs_and_more.py`
+
+- 本地提交：`6ccb371`
