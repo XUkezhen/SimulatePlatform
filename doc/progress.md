@@ -52,4 +52,4 @@
 - **数据库迁移**
   - 新增迁移文件：`0017_error_interfaceid_scene_channelconfigs_and_more.py`
 
-- 本地提交：`6ccb371`
+- 本地提交：`f388bf9` (主要功能), `8db5bb6` (文档更新)
