@@ -235,10 +235,6 @@ class Subnet(models.Model):
     def __str__(self):
         return self.subnetName
 
-DEFAULT_INTERFACE_DETAIL = {
-
-}
-
 class Interface(models.Model):
     class InterfaceTypeChoices(models.TextChoices):
         SUB = 'sub', 'Subnet Interface'
@@ -278,7 +274,7 @@ class Interface(models.Model):
         return result
 
     detail = models.JSONField(
-        default=DEFAULT_INTERFACE_DETAIL,
+        default=dict,
         verbose_name="Interface Detail",
         null=True,
         blank=True

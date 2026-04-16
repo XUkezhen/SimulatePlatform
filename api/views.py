@@ -4,8 +4,6 @@ from pathlib import Path
 import importlib.util
 from functools import lru_cache
 
-from pk.django.core.cache import cache
-
 '''
 以下是lykcode
 '''
