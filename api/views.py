@@ -67,6 +67,34 @@ from .network_layer_data import find_bellmanford_files, get_block_by_sim_time, p
 from .物理层数据采集2 import extract_config_parameters
 from .链路层数据采集 import process_link_relationships
 
+
+def _extract_channel_name(channel_config):
+    if not isinstance(channel_config, dict):
+        return None
+
+    for key, value in channel_config.items():
+        if isinstance(key, str) and key.startswith('PROPAGATION-CHANNEL-NAME'):
+            return str(value)
+
+    return None
+
+
+def _get_scene_channel_data(scene):
+    raw_channel_configs = scene.channelConfigs or []
+    if not isinstance(raw_channel_configs, list):
+        return [], [], 'Channel0'
+
+    channel_configs = [config for config in raw_channel_configs if isinstance(config, dict)]
+    channel_names = []
+
+    for config in channel_configs:
+        channel_name = _extract_channel_name(config)
+        if channel_name:
+            channel_names.append(channel_name)
+
+    primary_channel_name = channel_names[0] if channel_names else 'Channel0'
+    return channel_configs, channel_names, primary_channel_name
+
 @require_http_methods(["POST"])
 @csrf_exempt
 def add_scene_list(request):
@@ -2633,15 +2661,7 @@ def get_channel_names(request):
     except Scene.DoesNotExist:
         return JsonResponse({'status': 'error', 'message': '场景不存在'}, status=404)
 
-    channel_names = []
-    channel_configs = scene.channelConfigs or []
-
-    for config in channel_configs:
-        # 查找 PROPAGATION-CHANNEL-NAME[*] 键
-        for key, value in config.items():
-            if key.startswith('PROPAGATION-CHANNEL-NAME'):
-                channel_names.append(value)
-                break
+    _, channel_names, _ = _get_scene_channel_data(scene)
 
     return JsonResponse({
         'status': 'success',
@@ -3603,6 +3623,7 @@ def download_all_files(request):
     print(node_id_map)
     print(link_id_map)
     print(subnet_id_map)
+    channel_configs, _, primary_channel_name = _get_scene_channel_data(scene)
     # 准备模板数据
     exata_config_data = {
         'scene': scene,
@@ -3618,6 +3639,8 @@ def download_all_files(request):
         "include_fault_config": has_fault_data,
         "node_id_map": node_id_map,
         "link_id_map": link_id_map,
+        "channel_configs": channel_configs,
+        "primary_channel_name": primary_channel_name,
     }
 
     # # 生成 Exata 配置文件内容

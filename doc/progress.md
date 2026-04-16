@@ -36,6 +36,7 @@
   - Scene 模型新增 `channelCount`（信道数量）和 `channelConfigs`（信道配置列表，JSONField）字段
   - 场景 API 支持：创建、编辑、查询场景时传递信道配置参数
   - 新增接口：`GET /api/getChannelNames?sceneId=xxx` 获取场景下所有信道名称
+  - `exata_config.template` 的 Channel Properties 改为按 `channelConfigs` 动态输出，`PHY-LISTENABLE-CHANNELS` / `PHY-LISTENING-CHANNELS` 跟随首个信道名
 
 - **节点故障添加接口选择**
   - Error 模型新增 `interfaceId` 字段（可选外键，关联 Interface）
