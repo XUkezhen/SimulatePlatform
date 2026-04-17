@@ -10,6 +10,12 @@ MULTI-GUI-INTERFACE NO
 GUI-CONFIG-LOCKED NO
 DUMMY-GLOBAL-FILTER-ENABLE NO
 NUM-NODES {{ num_nodes }}
+{% if llc_enabled %}
+LLC-ENABLED YES
+{% endif %}
+{% if arp_enabled %}
+ARP-ENABLED YES
+{% endif %}
 
 #*******************Parallel Settings***********************************
 
@@ -44,32 +50,11 @@ UNDERWATER-VISUALIZATION-ENABLED NO
 
 #******************Channel Properties***********************************
 
-PROPAGATION-CHANNEL-NAME[0] Channel0
-PROPAGATION-CHANNEL-FREQUENCY[0] 2400000000.000000
-PROPAGATION-MODEL[0] STATISTICAL
-PROPAGATION-PATHLOSS-MODEL[0] TWO-RAY
-PROPAGATION-SHADOWING-MODEL[0] CONSTANT
-PROPAGATION-SHADOWING-MEAN[0] 4.0
-PROPAGATION-FADING-MODEL[0] NONE
-PROPAGATION-ENABLE-CHANNEL-OVERLAP-CHECK[0] NO
-PROPAGATION-SPEED[0] 3e8
-PROPAGATION-LIMIT[0] -111.0
-PROPAGATION-MAX-DISTANCE[0] 0
-PROPAGATION-COMMUNICATION-PROXIMITY[0] 400
-PROPAGATION-PROFILE-UPDATE-RATIO[0] 0.0
-PROPAGATION-CHANNEL-NAME[1] Channel1
-PROPAGATION-CHANNEL-FREQUENCY[1] 2400000000.000000
-PROPAGATION-MODEL[1] STATISTICAL
-PROPAGATION-PATHLOSS-MODEL[1] TWO-RAY
-PROPAGATION-SHADOWING-MODEL[1] CONSTANT
-PROPAGATION-SHADOWING-MEAN[1] 4.0
-PROPAGATION-FADING-MODEL[1] NONE
-PROPAGATION-ENABLE-CHANNEL-OVERLAP-CHECK[1] NO
-PROPAGATION-SPEED[1] 3e8
-PROPAGATION-LIMIT[1] -111.0
-PROPAGATION-MAX-DISTANCE[1] 0
-PROPAGATION-COMMUNICATION-PROXIMITY[1] 400
-PROPAGATION-PROFILE-UPDATE-RATIO[1] 0.0
+{% for channel_config in channel_configs -%}
+{% for key, value in channel_config.items() -%}
+{{ key }} {{ value }}
+{% endfor -%}
+{% endfor -%}
 DUMMY-MIMO-PARAMETERS NO
 
 
@@ -199,8 +184,8 @@ SOCKET-INTERFACE-ONLY-DEACTIVATE-MAPPED-NODES NO
 VRLINK NO
 
 #**********************Physical Layer***********************************
-PHY-LISTENABLE-CHANNELS Channel0
-PHY-LISTENING-CHANNELS Channel0
+PHY-LISTENABLE-CHANNELS {{ primary_channel_name }}
+PHY-LISTENING-CHANNELS {{ primary_channel_name }}
 PHY-MODEL PHY802.11b
 PHY802.11-AUTO-RATE-FALLBACK NO
 PHY802.11-DATA-RATE 2000000
@@ -396,14 +381,14 @@ IP-QUEUE-TYPE FIFO
 
 #********* [Default Wireless Subnet] ***********************************
 {% if default_subnet and default_subnet.interfaces.all() %}
-SUBNET N8-{{ default_subnet.subnetIp }} { {{ isolated_node_ids | join(', ') }} } SUBNET-UUID SUB{{ default_subnet.id }} Default
+SUBNET N8-{{ default_subnet.subnetIp }} { {{ isolated_node_ids | join(', ') }} } SUBNET-UUID SUB{{ subnet_id_map[default_subnet.id] }} Default
 {% endif %}
 
 
 {% for subnet in subnets %}
 {% if subnet.interfaces.all() %}
 #************* Subnet Configuration ***********************************
-SUBNET N8-{{ subnet.subnetIp }} { {% for interface in subnet.interfaces.all() %}{{ node_id_map[ interface.node.id ]}}{% if not loop.last %}, {% endif %}{% endfor %} } SUBNET-UUID SUB{{ subnet.id }}
+SUBNET N8-{{ subnet.subnetIp }} { {% for interface in subnet.interfaces.all() %}{{ node_id_map[ interface.node.id ]}}{% if not loop.last %}, {% endif %}{% endfor %} } SUBNET-UUID SUB{{ subnet_id_map[subnet.id] }}
 #**********************Physical Layer***********************************
 {% if subnet.details %}
 {% for key, value in subnet.details.items() %}
@@ -418,23 +403,24 @@ SUBNET N8-{{ subnet.subnetIp }} { {% for interface in subnet.interfaces.all() %}
 
 
 {% for link in links %}
+{% set exported_link_id = link_id_map[link.id] %}
 #**************************** [Link] ***********************************
-LINK N8-{{ link.subnet.subnetIp }} { {{ node_id_map[link.sourceNodeId.id] }}, {{ node_id_map[link.destinationNodeId.id] }} } LINK-UUID LINK{{ link.id }}
+LINK N8-{{ link.subnet.subnetIp }} { {{ node_id_map[link.sourceNodeId.id] }}, {{ node_id_map[link.destinationNodeId.id] }} } LINK-UUID LINK{{ exported_link_id }}
 #******POINT TO POINT LINK PROPERTIES***********************************
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-PHY-TYPE {% if link.linkType == '无线' %}WIRELESS{% else %}WIRED{% endif %}
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-MAC-PROTOCOL ABSTRACT
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] IP-FRAGMENTATION-UNIT 2048
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-PHY-TYPE {% if link.linkType == '无线' %}WIRELESS{% else %}WIRED{% endif %}
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-MAC-PROTOCOL ABSTRACT
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] IP-FRAGMENTATION-UNIT 2048
 {# 只有当 linkConfig 为 True 时才输出链路参数配置 #}
 {% if link.linkConfig %}
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] DUMMY-GUI-SYMMETRIC-LINK YES
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-BANDWIDTH {{ link.bandwidth|round(6) }}
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-HEADER-SIZE-IN-BITS {{ link.packetHeaderSize }}{% if link.transmissionDelay %}
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-PROPAGATION-DELAY {{ link.transmissionDelay }}MS{% endif %}
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] DUMMY-GUI-SYMMETRIC-LINK YES
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-BANDWIDTH {{ link.bandwidth|round(6) }}
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-HEADER-SIZE-IN-BITS {{ link.packetHeaderSize }}{% if link.transmissionDelay %}
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-PROPAGATION-DELAY {{ link.transmissionDelay }}MS{% endif %}
 {% if link.linkType == '有线' and link.packetLossRate %}
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-DROP-PROBABILITY {{ link.packetLossRate|round(6) }}
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] LINK-DROP-PROBABILITY {{ link.packetLossRate|round(6) }}
 {% endif %}
 {% else %}
-[LINK{{ link.id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ link.id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] DUMMY-GUI-SYMMETRIC-LINK NO
+[LINK{{ exported_link_id }}/{{ node_id_map[link.sourceNodeId.id] }}/{{ link.sourceInterface.interfaceIndex }} LINK{{ exported_link_id }}/{{ node_id_map[link.destinationNodeId.id] }}/{{ link.destinationInterface.interfaceIndex }}] DUMMY-GUI-SYMMETRIC-LINK NO
 {% endif %}
 {% endfor %}
 
@@ -443,14 +429,19 @@ LINK N8-{{ link.subnet.subnetIp }} { {{ node_id_map[link.sourceNodeId.id] }}, {{
 
 
 
+{% if static_route_nodes %}
+[{{ static_route_nodes | join(' ') }}] STATIC-ROUTE YES
+[{{ static_route_nodes | join(' ') }}] STATIC-ROUTE-FILE {{ static_route_file_path }}
+
+{% endif %}
 #************* Interface Configuration ***********************************
 {% for node in nodes %}{% for interface in node.interfaces.all() %}
 [{{ node_id_map[node.id] }}] NETWORK-PROTOCOL[{{ interface.interfaceIndex }}]       IP{% if interface.interfaceType == 'sub' %}
-[SUB{{ interface.subnet.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] IP-ADDRESS {{ interface.interfaceIp }}
+[SUB{{ subnet_id_map[interface.subnet.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] IP-ADDRESS {{ interface.interfaceIp }}
 {% elif interface.interfaceType == 'link' %}{% if interface.source_link %}
-[LINK{{ interface.source_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] IP-ADDRESS {{ interface.interfaceIp }}
+[LINK{{ link_id_map[interface.source_link.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] IP-ADDRESS {{ interface.interfaceIp }}
   {% elif interface.destination_link %}
-[LINK{{ interface.destination_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] IP-ADDRESS {{ interface.interfaceIp }}
+[LINK{{ link_id_map[interface.destination_link.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] IP-ADDRESS {{ interface.interfaceIp }}
   {% endif %}
 {% endif %}
 {% endfor %}
@@ -461,31 +452,31 @@ LINK N8-{{ link.subnet.subnetIp }} { {{ node_id_map[link.sourceNodeId.id] }}, {{
   {% for interface in node.interfaces.all() %}
     {% if interface.interfaceType == 'sub' %}
       {% for key, value in interface.detail.get('Physical', {}).items() %}
-[SUB{{ interface.subnet.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
+[SUB{{ subnet_id_map[interface.subnet.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
       {% endfor %}
       {% for key, value in interface.detail.get('MAC', {}).items() %}
-[SUB{{ interface.subnet.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
+[SUB{{ subnet_id_map[interface.subnet.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
       {% endfor %}
       {% set routing_protocol = interface.detail.get('Routing', {}).get('ROUTING-PROTOCOL-IPv4') %}
       {% if routing_protocol and routing_protocol != 'BellmanFord' %}
-[SUB{{ interface.subnet.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
+[SUB{{ subnet_id_map[interface.subnet.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
       {% endif %}
     {% elif interface.interfaceType == 'link' %}
       {% if interface.source_link %}
         {% for key, value in interface.detail.get('MAC', {}).items() %}
-[LINK{{ interface.source_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
+[LINK{{ link_id_map[interface.source_link.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
         {% endfor %}
         {% set routing_protocol = interface.detail.get('Routing', {}).get('ROUTING-PROTOCOL-IPv4') %}
         {% if routing_protocol and routing_protocol != 'BellmanFord' %}
-[LINK{{ interface.source_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
+[LINK{{ link_id_map[interface.source_link.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
         {% endif %}
       {% elif interface.destination_link %}
        {% for key, value in interface.detail.get('MAC', {}).items() %}
-[LINK{{ interface.destination_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
+[LINK{{ link_id_map[interface.destination_link.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] {{ key }} {{ value }}
         {% endfor %}
         {% set routing_protocol = interface.detail.get('Routing', {}).get('ROUTING-PROTOCOL-IPv4') %}
         {% if routing_protocol and routing_protocol != 'BellmanFord' %}
-[LINK{{ interface.destination_link.id }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
+[LINK{{ link_id_map[interface.destination_link.id] }}/{{ node_id_map[node.id] }}/{{ interface.interfaceIndex }}] ROUTING-PROTOCOL-IPv4 {{ routing_protocol }}
         {% endif %}
       {% endif %}
     {% endif %}

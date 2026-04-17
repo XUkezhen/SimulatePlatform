@@ -5,6 +5,28 @@ from django.utils import timezone
 from django.core.exceptions import ValidationError
 
 
+BUSINESS_TYPE_POISSON = 'POISSON'
+BUSINESS_TYPE_BROADCAST = 'BROADCAST'
+BUSINESS_TYPE_MULTICAST = 'MULTICAST'
+
+BUSINESS_TYPE_ALIAS_MAP = {
+    '泊松分布': BUSINESS_TYPE_POISSON,
+    '广播业务': BUSINESS_TYPE_BROADCAST,
+    '组播业务': BUSINESS_TYPE_MULTICAST,
+    BUSINESS_TYPE_POISSON: BUSINESS_TYPE_POISSON,
+    BUSINESS_TYPE_BROADCAST: BUSINESS_TYPE_BROADCAST,
+    BUSINESS_TYPE_MULTICAST: BUSINESS_TYPE_MULTICAST,
+}
+
+
+def normalize_business_type(value):
+    if value in [None, '']:
+        return value
+    text = str(value).strip()
+    upper_text = text.upper()
+    return BUSINESS_TYPE_ALIAS_MAP.get(text, BUSINESS_TYPE_ALIAS_MAP.get(upper_text, text))
+
+
 
 # 3.7号下午   本版本修改了node模型，接口模型未设置，链路模型没改。。
 # 3.9晚上9点，新建了接口模型，链路模型一并修改。
@@ -23,10 +45,19 @@ from django.core.exceptions import ValidationError
 #6.10 下午，8002已全部更新完毕，下一步，子网配置
 #6.12上午，子网
 class Scene(models.Model):
+    YES_NO_CHOICES = [
+        ('YES', 'YES'),
+        ('NO', 'NO'),
+    ]
+
     sceneName = models.CharField(max_length=100)
     startTime = models.DateTimeField()
     endTime = models.DateTimeField()
     simulationStep = models.IntegerField()  # 新增仿真步长字段
+    channelCount = models.IntegerField(default=0, verbose_name="信道数量")
+    channelConfigs = models.JSONField(null=True, blank=True, default=list, verbose_name="信道配置列表")
+    llcEnabled = models.CharField(max_length=3, choices=YES_NO_CHOICES, default='YES', verbose_name="是否启用逻辑链路控制")
+    arpEnabled = models.CharField(max_length=3, choices=YES_NO_CHOICES, default='YES', verbose_name="是否启用地址解析协议")
     COORDINATE_CHOICES = [
         ('CARTESIAN', 'Cartesian'),#大写是写入数据库的，小写是展示用的
         ('LATLONALT', 'LatLonAlt'),
@@ -158,6 +189,9 @@ class Configuration(models.Model):
         ('FTP', 'FTP'),
         ('TRAFFIC-GEN', 'TRAFFIC-GEN'),
         ('HTTP', 'HTTP'),
+        (BUSINESS_TYPE_POISSON, BUSINESS_TYPE_POISSON),
+        (BUSINESS_TYPE_BROADCAST, BUSINESS_TYPE_BROADCAST),
+        (BUSINESS_TYPE_MULTICAST, BUSINESS_TYPE_MULTICAST),
     )
 
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='configurations', default=12)
@@ -209,6 +243,34 @@ class Configuration(models.Model):
     )
     httpStartTime = models.FloatField(null=True, blank=True, verbose_name='HTTP开始时间（s）')
     httpThreshTime = models.FloatField(null=True, blank=True, verbose_name='HTTP阈值时间（s）')
+
+    # ========== 泊松分布配置 ==========
+    poissonStartTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='泊松分布开始时间')
+    poissonEndTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='泊松分布结束时间')
+    poissonMeanInterval = models.CharField(max_length=50, null=True, blank=True, verbose_name='平均发包间隔')
+    poissonPacketSize = models.IntegerField(null=True, blank=True, verbose_name='发送包大小')
+
+    # ========== 广播业务配置 ==========
+    broadcastDest = models.CharField(max_length=255, null=True, blank=True, verbose_name='广播目的地址')
+    broadcastTransportType = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播传输类型')
+    broadcastAppType = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播应用类型')
+    broadcastLifeTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播生命周期')
+    broadcastStartTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播启动时间')
+    broadcastInterval = models.CharField(max_length=50, null=True, blank=True, verbose_name='广播发送间隔')
+    broadcastFragmentSize = models.IntegerField(null=True, blank=True, verbose_name='广播分片大小')
+    broadcastFragmentNum = models.IntegerField(null=True, blank=True, verbose_name='广播分片数量')
+
+    # ========== 组播业务配置 ==========
+    multicastDestination = models.CharField(max_length=255, null=True, blank=True, verbose_name='组播目的地址')
+    multicastItemsToSend = models.IntegerField(null=True, blank=True, verbose_name='组播发送报文总数')
+    multicastItemSize = models.IntegerField(null=True, blank=True, verbose_name='组播单报文大小')
+    multicastInterval = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播发送间隔')
+    multicastStartTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播启动时间')
+    multicastEndTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播结束时间')
+
+    def save(self, *args, **kwargs):
+        self.businessType = normalize_business_type(self.businessType)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.businessType} - {self.businessName}'
@@ -390,6 +452,14 @@ class Error(models.Model):
     nodeId = models.ForeignKey(Node, on_delete=models.CASCADE, related_name='errors')
     errorStartTime = models.DateTimeField(null=True, blank=True, default=timezone.now)
     errorEndTime = models.DateTimeField(null=True, blank=True, default=timezone.now)
+    interfaceId = models.ForeignKey(
+        'Interface',
+        on_delete=models.CASCADE,
+        related_name='errors',
+        null=True,
+        blank=True,
+        verbose_name="接口ID"
+    )
 
 class LinkError(models.Model):
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='linkerrors', default=12)
