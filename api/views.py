@@ -63,6 +63,31 @@ import glob
 from typing import List, Dict, Tuple
 from django.conf import settings
 from jinja2 import Environment, FileSystemLoader
+
+
+def env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+EXATA_MANAGED_EXTERNALLY = env_flag("EXATA_MANAGED_EXTERNALLY", False)
+EXATA_SERVICE_HOST = os.getenv("EXATA_SERVICE_HOST", "127.0.0.1")
+EXATA_SERVICE_PORT = int(os.getenv("EXATA_SERVICE_PORT", "8005"))
+EXATA_EXECUTABLE_PATH = os.getenv(
+    "EXATA_EXECUTABLE_PATH",
+    r"D:\Exata\exata\7.3.0.0\bin\exata.exe",
+)
+EXATA_RESTART_SCRIPT = os.getenv("EXATA_RESTART_SCRIPT", "restart_daphne.bat")
+
+
+def build_exata_simulator(working_directory, config_file, **_ignored):
+    return ExataSimulator(
+        working_directory=working_directory,
+        executable_path=EXATA_EXECUTABLE_PATH,
+        config_file=config_file,
+    )
 from .network_layer_data import find_bellmanford_files, get_block_by_sim_time, parse_bellmanford_file
 from .物理层数据采集2 import extract_config_parameters
 from .链路层数据采集 import process_link_relationships
@@ -3368,6 +3393,168 @@ def get_slot_table(request):
     except Exception as e:
         return JsonResponse({"status": "error", "message": str(e)}, status=500)
 
+def _generate_scene_files(scene):
+    scene_folder = _resolve_scene_folder_path(scene)
+    _clear_scene_folder(scene_folder)
+
+    time_delta = scene.endTime - scene.startTime
+    simulation_duration = int(time_delta.total_seconds())
+
+    links = Link.objects.filter(sceneId=scene).select_related('sourceInterface', 'destinationInterface')
+    nodes = Node.objects.filter(sceneId=scene).prefetch_related('interfaces')
+    satellites = Node.objects.filter(sceneId=scene, nodeType='satellite')
+    normal_nodes = Node.objects.filter(sceneId=scene, nodeType='normalNode')
+    errors = Error.objects.filter(sceneId=scene)
+    num_nodes = Node.objects.filter(sceneId=scene).count()
+
+    default_subnet = Subnet.objects.filter(sceneId=scene).first()
+    isolated_nodes = Node.objects.filter(
+        sceneId=scene,
+        interfaces__subnet=default_subnet,
+    ).distinct()
+    isolated_node_ids = [node.id for node in isolated_nodes]
+
+    all_subnets = Subnet.objects.filter(
+        sceneId=scene,
+        subnetType=Subnet.SubnetTypeChoices.SUB,
+    ).prefetch_related('interfaces__node')
+    subnets = all_subnets.exclude(id=default_subnet.id if default_subnet else None)
+    has_app_data = Configuration.objects.filter(sceneId=scene).exists()
+    has_fault_data = (
+        LinkError.objects.filter(sceneId=scene).exists()
+        or Error.objects.filter(sceneId=scene).exists()
+    )
+    node_id_map = {node.id: idx + 1 for idx, node in enumerate(nodes)}
+    link_id_map = {link.id: idx + 1 for idx, link in enumerate(links)}
+    isolated_node_ids_mapped = [node_id_map[nid] for nid in isolated_node_ids]
+
+    exata_config_data = {
+        'scene': scene,
+        'num_nodes': num_nodes,
+        'nodes': nodes,
+        'links': links,
+        'simulation_duration': simulation_duration,
+        'default_subnet': default_subnet,
+        'subnets': subnets,
+        'isolated_node_ids': isolated_node_ids_mapped,
+        "include_app_config": has_app_data,
+        "include_fault_config": has_fault_data,
+        "node_id_map": node_id_map,
+        "link_id_map": link_id_map,
+    }
+
+    template_dir = Path(__file__).resolve().parent / 'templates'
+    env = Environment(loader=FileSystemLoader(str(template_dir)), lstrip_blocks=True)
+    template = env.get_template('exata/exata_config.template')
+    exata_config_content = template.render(exata_config_data)
+
+    sections: list[tuple[str, str]] = []
+
+    config_filename = f"{scene.sceneName}.config"
+    _write_scene_file(scene_folder, config_filename, exata_config_content)
+    sections.append((config_filename, exata_config_content))
+
+    if has_app_data:
+        app_content = generate_scene_app_content(scene, node_id_map)
+        app_filename = f"{scene.sceneName}.app"
+        _write_scene_file(scene_folder, app_filename, app_content)
+        sections.append((app_filename, app_content))
+
+    nodes_content = generate_scene_nodes_content(scene, node_id_map)
+    nodes_filename = f"{scene.sceneName}.nodes"
+    _write_scene_file(scene_folder, nodes_filename, nodes_content)
+    sections.append((nodes_filename, nodes_content))
+
+    if has_fault_data:
+        fault_content = generate_scene_fault_content(scene, node_id_map)
+        fault_filename = f"{scene.sceneName}.fault"
+        _write_scene_file(scene_folder, fault_filename, fault_content)
+        sections.append((fault_filename, fault_content))
+
+    display_content = generate_display_file_content(scene)
+    display_filename = f"{scene.sceneName}.display"
+    _write_scene_file(scene_folder, display_filename, display_content)
+    sections.append((display_filename, display_content))
+
+    type_dict = {}
+    for node in scene.nodes.all():
+        key = node.specialType or "Unknown"
+        type_dict.setdefault(key, []).append(node.id)
+
+    level_lines = []
+    for node_type in ["GEO", "PrimaryRegion", "SecondaryRegion", "GuidedMissile", "LEO"]:
+        ids = type_dict.get(node_type)
+        if not ids:
+            continue
+        level_lines.append(f"{node_type}\n")
+        id_line = " ".join(str(node_id_map[node_id]) for node_id in sorted(ids))
+        level_lines.append(f"{id_line}\n")
+    _write_scene_file(scene_folder, "level.txt", "".join(level_lines))
+
+    slot_table_obj = SlotTable.objects.filter(scene=scene).order_by('-id').first()
+    if slot_table_obj:
+        slot_table_data = format_slot_table(node_id_map, slot_table_obj.data)
+    else:
+        slot_table_data = ""
+        logger.warning("Scene %s has no slot table data; writing an empty slotTable.txt", scene.id)
+    _write_scene_file(scene_folder, "slotTable.txt", slot_table_data)
+
+    link_lines = []
+    for link in links:
+        source_interface_ip = link.sourceInterface.interfaceIp if link.sourceInterface else ""
+        destination_interface_ip = link.destinationInterface.interfaceIp if link.destinationInterface else ""
+        line = (
+            f"{link.id} -1 "
+            f"{node_id_map[link.sourceNodeId.id]} {node_id_map[link.destinationNodeId.id]} "
+            f"{link.sourceInterface.interfaceIndex if link.sourceInterface else ''} "
+            f"{link.destinationInterface.interfaceIndex if link.destinationInterface else ''} "
+            f"{source_interface_ip} {destination_interface_ip} "
+            f"{1 if link.linkType == '鏃犵嚎' else 2}\n"
+        )
+        link_lines.append(line)
+    link_content = "".join(link_lines)
+    _write_scene_file(scene_folder, "link.txt", link_content)
+    sections.append(("link.txt", link_content))
+
+    orbit_lines = []
+    for satellite in satellites:
+        line = (
+            f"{node_id_map[satellite.id]} "
+            f"{satellite.startTime.year} {satellite.startTime.month} {satellite.startTime.day} "
+            f"{satellite.startTime.hour} {satellite.startTime.minute} {satellite.startTime.second} "
+            f"{satellite.startTime.microsecond // 1000} "
+            f"{satellite.eccentricity} "
+            f"{satellite.argPerigee} "
+            f"{satellite.inclination} "
+            f"{satellite.meanAnomaly} "
+            f"{satellite.meanMotion} "
+            f"{satellite.raan} "
+            f"{satellite.nodeImage} "
+            f"{satellite.nodeName}\n"
+        )
+        orbit_lines.append(line)
+    orbit_content = "".join(orbit_lines)
+    _write_scene_file(scene_folder, "orbit.txt", orbit_content)
+    sections.append(("orbit.txt", orbit_content))
+
+    node_content = "".join(_build_node_txt_lines(normal_nodes.order_by('id'), node_id_map=node_id_map))
+    _write_scene_file(scene_folder, "node.txt", node_content)
+    sections.append(("node.txt", node_content))
+
+    fault_txt_content = "".join(_build_fault_txt_lines(scene, errors, node_id_map=node_id_map))
+    _write_scene_file(scene_folder, "fault.txt", fault_txt_content)
+    sections.append(("fault.txt", fault_txt_content))
+
+    simulation_end_time = (scene.endTime - scene.startTime).total_seconds()
+    initial_content = "".join([
+        f"INTERVAL {scene.simulationStep}\n",
+        f"FINAL {int(simulation_end_time)}\n",
+    ])
+    _write_scene_file(scene_folder, "initial.txt", initial_content)
+    sections.append(("initial.txt", initial_content))
+
+    return scene_folder, sections
+
 def download_all_files(request):
     scene_id = request.GET.get('sceneId')
     if not scene_id:
@@ -4671,8 +4858,6 @@ def start_simulation(request):
         }, status=500)
 
 
-
-
 def extract_node_from_filename(filename):
     """从文件名提取节点编号，如queuesize_node1.txt → 1"""
     match = re.search(r'node(\d+)', filename)
@@ -5268,8 +5453,8 @@ class SocketView(View):
             time.sleep(2)
         if SocketView.client_socket is None:  # 仅在未连接时创建连接
 
-            server_address = '127.0.0.1'
-            server_port = 8005
+            server_address = EXATA_SERVICE_HOST
+            server_port = EXATA_SERVICE_PORT
             SocketView.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
             SocketView.client_socket.connect((server_address, server_port))
@@ -5915,6 +6100,111 @@ class SocketView(View):
                 print(f"接收失败: {e}")
                 break
 
+    def _handle_connect_request(self):
+        global absolute_path
+        global selected_scene_name
+
+        SocketView.startSign = False
+        SocketView.initial_k = 1
+        SocketView.i = 0
+        SocketView.ddk1 = 1
+        SocketView.ddk2 = 1
+        SocketView.send_queue = []
+        SocketView.receive_queue = []
+        SocketView.handleMessage_queue = []
+        SocketView.sat_arr = []
+        SocketView.start_time = []
+        SocketView.print_state = 0
+        SocketView.stop_receive_message = 0
+        SocketView.stop_send_message = 0
+        SocketView.stop_handle_message = 0
+        SocketView.ip_list = []
+        SocketView.link_x = 1
+
+        if not selected_scene_name:
+            return JsonResponse({
+                "status": "error",
+                "message": "\u672a\u9009\u62e9\u573a\u666f\uff0c\u8bf7\u5148\u5728\u573a\u666f\u5217\u8868\u4e2d\u9009\u62e9\u573a\u666f\u5e76\u8fdb\u5165\u4eff\u771f\u9875\u9762\u3002"
+            }, status=400)
+
+        scene_path = absolute_path.resolve(strict=False)
+        required_files = [
+            scene_path / "orbit.txt",
+            scene_path / "node.txt",
+            scene_path / "initial.txt",
+        ]
+        missing_files = [file_path.name for file_path in required_files if not file_path.exists()]
+        if missing_files:
+            return JsonResponse({
+                "status": "error",
+                "message": (
+                    f"\u521d\u59cb\u5316\u5931\u8d25\uff0c\u7f3a\u5c11\u573a\u666f\u6587\u4ef6: {', '.join(missing_files)}\u3002"
+                    f"\u5f53\u524d\u573a\u666f\u76ee\u5f55: {scene_path}"
+                )
+            }, status=400)
+
+        try:
+            sat_init()
+        except FileNotFoundError as exc:
+            missing_name = Path(exc.filename).name if exc.filename else str(exc)
+            return JsonResponse({
+                "status": "error",
+                "message": (
+                    f"\u521d\u59cb\u5316\u5931\u8d25\uff0c\u7f3a\u5c11\u5fc5\u8981\u6587\u4ef6: {missing_name}\u3002"
+                    f"\u5f53\u524d\u573a\u666f\u76ee\u5f55: {scene_path}"
+                )
+            }, status=400)
+        except Exception as exc:
+            logger.error("Scene initialization failed during sat_init: %s", exc, exc_info=True)
+            return JsonResponse({
+                "status": "error",
+                "message": f"\u521d\u59cb\u5316\u5931\u8d25\uff0c\u573a\u666f\u6587\u4ef6\u89e3\u6790\u51fa\u9519: {exc}"
+            }, status=500)
+
+        if not EXATA_MANAGED_EXTERNALLY:
+            exata = build_exata_simulator(
+                working_directory=absolute_path,
+                executable_path=r"D:\Exata\exata\7.3.0.0\bin\exata.exe",
+                config_file=f"{selected_scene_name}.config",
+            )
+            exata.stop_simulation()
+            exata.run_simulation()
+            time.sleep(3)
+
+        try:
+            self.connect_to_server()
+        except ConnectionRefusedError:
+            return JsonResponse({
+                "status": "error",
+                "message": (
+                    f"\u521d\u59cb\u5316\u5931\u8d25\uff0c\u65e0\u6cd5\u8fde\u63a5 EXATA \u670d\u52a1 {EXATA_SERVICE_HOST}:{EXATA_SERVICE_PORT}\u3002"
+                    "\u8bf7\u786e\u8ba4 EXATA \u5df2\u542f\u52a8\uff0c\u4e14\u5957\u63a5\u5b57\u7aef\u53e3\u53ef\u7528\u3002"
+                )
+            }, status=502)
+        except OSError as exc:
+            logger.error("Scene initialization OS error: %s", exc, exc_info=True)
+            return JsonResponse({
+                "status": "error",
+                "message": f"\u521d\u59cb\u5316\u5931\u8d25\uff0c\u8fde\u63a5 EXATA \u65f6\u53d1\u751f\u7cfb\u7edf\u9519\u8bef: {exc}"
+            }, status=500)
+
+        SocketView.simulation_running = True
+        SocketView.message_indexStep = 0
+        SocketView.message_indexContinue = 0
+        SocketView.send_start_message(self)
+        SocketView.send_next_message(self)
+
+        if SocketView.startSign:
+            return JsonResponse({
+                "status": "success",
+                "message": "\u521d\u59cb\u5316\u6210\u529f"
+            })
+
+        return JsonResponse({
+            "status": "error",
+            "message": "\u521d\u59cb\u5316\u5b8c\u6210\uff0c\u4f46\u672a\u6536\u5230\u542f\u52a8\u786e\u8ba4\u3002"
+        }, status=500)
+
     @csrf_exempt
     def post(self, request):
         global absolute_path
@@ -5923,6 +6213,7 @@ class SocketView(View):
         if content_type == 'application/json':
             data = json.loads(request.body)
             if 'connect' in data:
+                return self._handle_connect_request()
                 SocketView.startSign = False
                 # 在仿真开始时，把消息队列设置为空
                 # sendtofrontbysocket(request, "web socket 已经建立", "", "")
@@ -5942,21 +6233,59 @@ class SocketView(View):
                 SocketView.stop_handle_message = 0
                 SocketView.ip_list = []
                 SocketView.link_x = 1
+                if not selected_scene_name:
+                    return JsonResponse({
+                        "status": "error",
+                        "message": "未选择场景，请先在场景列表中选择场景并进入仿真页面。"
+                    }, status=400)
+
+                scene_path = absolute_path.resolve(strict=False)
+                required_files = [
+                    scene_path / "orbit.txt",
+                    scene_path / "node.txt",
+                    scene_path / "initial.txt",
+                ]
+                missing_files = [file_path.name for file_path in required_files if not file_path.exists()]
+                if missing_files:
+                    return JsonResponse({
+                        "status": "error",
+                        "message": (
+                            f"初始化失败，缺少场景文件: {', '.join(missing_files)}。"
+                            f"当前场景目录: {scene_path}"
+                        )
+                    }, status=400)
+
                 sat_init()  # 初始化各个卫星
                 print(f"chushihua场景文件夹绝对路径: {absolute_path}")
-                exata = ExataSimulator(
+                if not EXATA_MANAGED_EXTERNALLY:
+                    exata = build_exata_simulator(
 
-                    working_directory=absolute_path,
+                        working_directory=absolute_path,
                     # executable_path=r"D:\Scalable\exata7.3.0.0\exata\7.3.0.0\bin\exata.exe",
                     executable_path=r"D:\Exata\exata\7.3.0.0\bin\exata.exe",#xkz exata地址
-                    config_file=f"{selected_scene_name}.config",
+                        config_file=f"{selected_scene_name}.config",
                     # config_file="fina1.config"
                 )
-                exata.stop_simulation()
+                    exata.stop_simulation()
                 #
-                exata.run_simulation()
-                time.sleep(3)
-                self.connect_to_server()
+                    exata.run_simulation()
+                    time.sleep(3)
+                try:
+                    self.connect_to_server()
+                except ConnectionRefusedError:
+                    return JsonResponse({
+                        "status": "error",
+                        "message": (
+                            f"初始化失败，无法连接 EXATA 服务 {EXATA_SERVICE_HOST}:{EXATA_SERVICE_PORT}。"
+                            "请确认 EXATA 已启动并监听该端口。"
+                        )
+                    }, status=502)
+                except OSError as exc:
+                    logger.error("Scene initialization OS error: %s", exc, exc_info=True)
+                    return JsonResponse({
+                        "status": "error",
+                        "message": f"初始化失败，系统错误: {exc}"
+                    }, status=500)
                 print(f"连接中")
                 SocketView.simulation_running = True
                 SocketView.message_indexStep = 0  # 当前发送的消息索引
@@ -5964,9 +6293,12 @@ class SocketView(View):
                 SocketView.send_start_message(self)
                 SocketView.send_next_message(self)
                 if SocketView.startSign:
-                    return JsonResponse({"status": "初始化成功了"})
+                    return JsonResponse({"status": "success", "message": "初始化成功"})
                 else:
-                    return JsonResponse({"status": "初始化失败了"})
+                    return JsonResponse({
+                        "status": "error",
+                        "message": "初始化完成，但未收到启动确认。"
+                    }, status=500)
 
             elif 'sendsimulationmessage' in data:
                 current_path = absolute_path  # 捕获当前路径值
@@ -6031,6 +6363,8 @@ class SocketView(View):
         SocketView.link_x = 1
         sat_init()  # 初始化各个卫星
         print(f"chushihua场景文件夹绝对路径: {absolute_path}")
+        if EXATA_MANAGED_EXTERNALLY:
+            return {"status": "仿真已停止，EXATA 由外部宿主机管理"}
         exata = ExataSimulator(
 
             working_directory=absolute_path,
@@ -6039,7 +6373,7 @@ class SocketView(View):
             # config_file="fina1.config"
         )
         exata.stop_simulation()
-        script_path = "restart_daphne.bat"
+        script_path = EXATA_RESTART_SCRIPT
 
         if not os.path.exists(script_path):
             print(f"错误：重启脚本 '{script_path}' 未找到。无法重启服务。")
