@@ -53,6 +53,7 @@ from .serializers import ConfigurationSerializer
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.decorators import api_view
+from django.utils import timezone
 from datetime import datetime
 from ipaddress import IPv4Network, AddressValueError
 from django.shortcuts import get_object_or_404
@@ -76,9 +77,13 @@ EXATA_SERVICE_HOST = os.getenv("EXATA_SERVICE_HOST", "127.0.0.1")
 EXATA_SERVICE_PORT = int(os.getenv("EXATA_SERVICE_PORT", "8005"))
 EXATA_EXECUTABLE_PATH = os.getenv(
     "EXATA_EXECUTABLE_PATH",
-    r"D:\Exata\exata\7.3.0.0\bin\exata.exe",
+    str(Path(__file__).resolve().parents[2] / "exata.exe"),
 )
-EXATA_RESTART_SCRIPT = os.getenv("EXATA_RESTART_SCRIPT", "restart_daphne.bat")
+EXATA_RESTART_SCRIPT = os.getenv("EXATA_RESTART_SCRIPT", "restart_backend_pm2.bat")
+PM2_LOG_DIR = Path(
+    os.getenv("PM2_LOG_DIR", str(Path.home() / ".pm2" / "logs"))
+)
+RUNTIME_LOG_LINE_LIMIT = int(os.getenv("RUNTIME_LOG_LINE_LIMIT", "200"))
 
 
 def build_exata_simulator(working_directory, config_file, **_ignored):
@@ -87,6 +92,37 @@ def build_exata_simulator(working_directory, config_file, **_ignored):
         executable_path=EXATA_EXECUTABLE_PATH,
         config_file=config_file,
     )
+
+
+def create_exata_simulator(working_directory, config_file):
+    return build_exata_simulator(
+        working_directory=working_directory,
+        config_file=config_file,
+    )
+
+
+def _parse_int(value, default):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _decode_log_bytes(content):
+    for encoding in ("utf-8", "gb18030", "gbk", "latin-1"):
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="replace")
+
+
+def _read_log_tail(path: Path, lines: int) -> list[str]:
+    if not path.exists() or not path.is_file():
+        return []
+
+    text = _decode_log_bytes(path.read_bytes())
+    return text.splitlines()[-lines:]
 from .network_layer_data import find_bellmanford_files, get_block_by_sim_time, parse_bellmanford_file
 from .物理层数据采集2 import extract_config_parameters
 from .链路层数据采集 import process_link_relationships
@@ -258,6 +294,84 @@ def _parse_link_relationships_file(file_path: Path) -> List[Dict]:
 SCENE_LLC_API_KEY = 'LLC-ENABLED'
 SCENE_ARP_API_KEY = 'ARP-ENABLED'
 
+
+def _default_scene_start_time():
+    return timezone.now().replace(second=0, microsecond=0)
+
+
+def _parse_scene_datetime(value, field_name):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            raise ValidationError(f'{field_name} 不能为空')
+        if text.endswith('Z'):
+            text = text[:-1] + '+00:00'
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValidationError(f'{field_name} 时间格式无效') from exc
+    else:
+        raise ValidationError(f'{field_name} 时间格式无效')
+
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
+
+
+def _parse_scene_duration_seconds(value):
+    if value in [None, '']:
+        return None
+
+    if isinstance(value, bool):
+        raise ValidationError('durationSeconds 必须是正整数')
+
+    if isinstance(value, int):
+        duration_seconds = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ValidationError('durationSeconds 必须是正整数')
+        duration_seconds = int(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text or not re.fullmatch(r'[+-]?\d+', text):
+            raise ValidationError('durationSeconds 必须是正整数')
+        duration_seconds = int(text)
+    else:
+        raise ValidationError('durationSeconds 必须是正整数')
+
+    if duration_seconds <= 0:
+        raise ValidationError('durationSeconds 必须大于 0')
+    return duration_seconds
+
+
+def _resolve_scene_time_range(start_time_value, end_time_value, duration_value, *, existing_start_time=None, existing_end_time=None):
+    if start_time_value in [None, '']:
+        start_time = existing_start_time or _default_scene_start_time()
+    else:
+        start_time = _parse_scene_datetime(start_time_value, 'startTime')
+
+    duration_seconds = _parse_scene_duration_seconds(duration_value)
+
+    if duration_seconds is not None:
+        end_time = start_time + timedelta(seconds=duration_seconds)
+    elif end_time_value not in [None, '']:
+        end_time = _parse_scene_datetime(end_time_value, 'endTime')
+    elif existing_start_time and existing_end_time:
+        end_time = start_time + (existing_end_time - existing_start_time)
+    else:
+        raise ValidationError('缺少必填字段: durationSeconds')
+
+    if end_time <= start_time:
+        raise ValidationError('开始时间必须早于结束时间')
+
+    duration_seconds = int((end_time - start_time).total_seconds())
+    if duration_seconds <= 0:
+        raise ValidationError('durationSeconds 必须大于 0')
+
+    return start_time, end_time, duration_seconds
+
 @require_http_methods(["POST"])
 @csrf_exempt
 def add_scene_list(request):
@@ -273,6 +387,7 @@ def add_scene_list(request):
         scene_name = data.get('sceneName')
         start_time_str = data.get('startTime')
         end_time_str = data.get('endTime')
+        duration_seconds_raw = data.get('durationSeconds')
         simulation_step = data.get('simulationStep')
         channel_count = data.get('channelCount', 0)
         channel_configs = data.get('channelConfigs', [])
@@ -290,20 +405,22 @@ def add_scene_list(request):
         }, status=400)
 
     # 验证必要参数是否存在
-    if not all([scene_name, start_time_str, end_time_str, simulation_step]):
+    if not all([scene_name, simulation_step]) or (duration_seconds_raw in [None, ''] and end_time_str in [None, '']):
         return JsonResponse({
             'status': 'error',
-            'message': 'Missing required fields: sceneName, startTime, endTime, simulationStep'
+            'message': 'Missing required fields: sceneName, simulationStep, durationSeconds'
         }, status=400)
 
-    # 尝试转换时间格式
     try:
-        start_time = timezone.datetime.fromisoformat(start_time_str)
-        end_time = timezone.datetime.fromisoformat(end_time_str)
-    except (ValueError, TypeError):
+        start_time, end_time, duration_seconds = _resolve_scene_time_range(
+            start_time_str,
+            end_time_str,
+            duration_seconds_raw,
+        )
+    except ValidationError as e:
         return JsonResponse({
             'status': 'error',
-            'message': 'Invalid datetime format. Use ISO format: YYYY-MM-DDTHH:MM:SS'
+            'message': str(e)
         }, status=400)
 
     # 验证仿真步长为整数
@@ -369,7 +486,8 @@ def add_scene_list(request):
         return JsonResponse({
             'status': 'success',
             'sceneId': scene.id,
-            'sceneName': scene.sceneName
+            'sceneName': scene.sceneName,
+            'durationSeconds': duration_seconds,
         })
 
     except ValidationError as e:
@@ -433,6 +551,7 @@ def edit_scene_list(request, scene_id):
         new_scene_name = data.get('sceneName', scene.sceneName)
         new_start_time = data.get('startTime', scene.startTime)
         new_end_time = data.get('endTime', scene.endTime)
+        new_duration_seconds = data.get('durationSeconds')
         new_simulation_step = int(data.get('simulationStep', scene.simulationStep))
         new_channel_count = data.get('channelCount', scene.channelCount)
         new_channel_configs = data.get('channelConfigs', scene.channelConfigs)
@@ -451,9 +570,16 @@ def edit_scene_list(request, scene_id):
         if Scene.objects.exclude(id=scene_id).filter(sceneName=new_scene_name).exists():
             return JsonResponse({'status': 'error', 'message': '该场景名称已存在，请使用其他名称'}, status=400)
 
-        # 验证开始时间是否早于结束时间
-        if new_start_time >= new_end_time:
-            return JsonResponse({'status': 'error', 'message': '开始时间必须早于结束时间'}, status=400)
+        try:
+            new_start_time, new_end_time, duration_seconds = _resolve_scene_time_range(
+                new_start_time,
+                new_end_time,
+                new_duration_seconds,
+                existing_start_time=scene.startTime,
+                existing_end_time=scene.endTime,
+            )
+        except ValidationError as e:
+            return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
         # 验证信道配置
         if new_channel_count is not None:
@@ -470,6 +596,12 @@ def edit_scene_list(request, scene_id):
             if new_channel_count is not None and len(new_channel_configs) != new_channel_count:
                 return JsonResponse({'status': 'error', 'message': 'channelConfigs length must match channelCount'}, status=400)
 
+        if new_scene_name != scene.sceneName:
+            try:
+                _rename_scene_directory_and_files(scene.sceneName, new_scene_name)
+            except ValueError as e:
+                return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
         # 更新场景信息
         scene.sceneName = new_scene_name
         scene.startTime = new_start_time
@@ -481,7 +613,7 @@ def edit_scene_list(request, scene_id):
         scene.arpEnabled = new_arp_enabled
         scene.save()
 
-        return JsonResponse({'status': 'success'})
+        return JsonResponse({'status': 'success', 'durationSeconds': duration_seconds})
 
     except Scene.DoesNotExist:
         return JsonResponse({'status': 'error', 'message': '场景不存在'}, status=404)
@@ -512,6 +644,7 @@ def get_scene_list(request):
         'sceneName': scene.sceneName,
         'startTime': scene.startTime.isoformat(),
         'endTime': scene.endTime.isoformat(),
+        'durationSeconds': int((scene.endTime - scene.startTime).total_seconds()),
         'simulationStep': scene.simulationStep,
         'channelCount': scene.channelCount,
         'channelConfigs': scene.channelConfigs,
@@ -527,6 +660,26 @@ def get_scene_list(request):
         'has_previous': page_obj.has_previous(),
         'total_pages': page_obj.paginator.num_pages,
         'total_count': paginator.count
+    })
+
+
+@require_http_methods(["GET"])
+@csrf_exempt
+def get_runtime_logs(request):
+    requested_lines = _parse_int(request.GET.get("lines"), 80)
+    lines = max(1, min(requested_lines, RUNTIME_LOG_LINE_LIMIT))
+
+    backend_error_log = PM2_LOG_DIR / "backend-error.log"
+    backend_out_log = PM2_LOG_DIR / "backend-out.log"
+
+    return JsonResponse({
+        "updatedAt": datetime.utcnow().isoformat() + "Z",
+        "lines": lines,
+        "logDir": str(PM2_LOG_DIR),
+        "logs": {
+            "backendError": _read_log_tail(backend_error_log, lines),
+            "backendOut": _read_log_tail(backend_out_log, lines),
+        },
     })
 
 
@@ -3421,6 +3574,7 @@ logger = logging.getLogger(__name__)
 STATIC_ROUTE_PROTOCOL = 'NONE'
 STATIC_ROUTE_UPLOAD_FIELD = 'STATIC-ROUTE'
 STATIC_ROUTE_FOLDER_NAME = 'staticroute'
+SCENE_NAMED_FILE_SUFFIXES = ('.config', '.app', '.nodes', '.fault', '.display')
 
 
 def _parse_interface_detail_json(detail):
@@ -3459,6 +3613,71 @@ def _resolve_scene_folder_path(scene):
         raise ValueError(f'非法场景目录: {scene.sceneName}') from exc
 
     return scene_folder
+
+
+def _resolve_scene_folder_by_name(scene_name):
+    scene_root = _get_scene_files_root().resolve(strict=False)
+    scene_folder = (scene_root / scene_name).resolve(strict=False)
+
+    try:
+        scene_folder.relative_to(scene_root)
+    except ValueError as exc:
+        raise ValueError(f'非法场景目录: {scene_name}') from exc
+
+    return scene_root, scene_folder
+
+
+def _rename_scene_directory_and_files(old_scene_name, new_scene_name):
+    if old_scene_name == new_scene_name:
+        return
+
+    scene_root, old_scene_folder = _resolve_scene_folder_by_name(old_scene_name)
+    _, new_scene_folder = _resolve_scene_folder_by_name(new_scene_name)
+
+    if not old_scene_folder.exists():
+        return
+
+    if not old_scene_folder.is_dir():
+        raise ValueError(f'原场景目录不是文件夹: {old_scene_name}')
+
+    if new_scene_folder.exists():
+        raise ValueError(f'目标场景目录已存在: {new_scene_name}')
+
+    renamed_files = []
+    directory_renamed = False
+
+    try:
+        old_scene_folder.rename(new_scene_folder)
+        directory_renamed = True
+
+        for suffix in SCENE_NAMED_FILE_SUFFIXES:
+            old_file = (new_scene_folder / f'{old_scene_name}{suffix}').resolve(strict=False)
+            new_file = (new_scene_folder / f'{new_scene_name}{suffix}').resolve(strict=False)
+
+            try:
+                old_file.relative_to(new_scene_folder)
+                new_file.relative_to(new_scene_folder)
+            except ValueError as exc:
+                raise ValueError(f'场景文件路径非法: {suffix}') from exc
+
+            if not old_file.exists():
+                continue
+
+            if new_file.exists():
+                raise ValueError(f'目标场景文件已存在: {new_file.name}')
+
+            old_file.rename(new_file)
+            renamed_files.append((old_file, new_file))
+
+    except Exception as exc:
+        for old_file, new_file in reversed(renamed_files):
+            if new_file.exists() and not old_file.exists():
+                new_file.rename(old_file)
+
+        if directory_renamed and new_scene_folder.exists() and not old_scene_folder.exists():
+            new_scene_folder.rename(old_scene_folder)
+
+        raise ValueError(f'场景改名失败: {exc}') from exc
 
 
 def _resolve_static_route_directory(scene, create=False):
@@ -3605,6 +3824,7 @@ def _build_export_context(scene):
         'primary_channel_name': primary_channel_name,
         'static_route_nodes': static_route_nodes,
         'static_route_file_path': static_route_file_path,
+        'exata_service_port': EXATA_SERVICE_PORT,
     }
 
 
@@ -6781,9 +7001,8 @@ class SocketView(View):
             }, status=500)
 
         if not EXATA_MANAGED_EXTERNALLY:
-            exata = build_exata_simulator(
+            exata = create_exata_simulator(
                 working_directory=absolute_path,
-                executable_path=r"D:\Exata\exata\7.3.0.0\bin\exata.exe",
                 config_file=f"{selected_scene_name}.config",
             )
             exata.stop_simulation()
@@ -6877,14 +7096,10 @@ class SocketView(View):
                 sat_init()  # 初始化各个卫星
                 print(f"chushihua场景文件夹绝对路径: {absolute_path}")
                 if not EXATA_MANAGED_EXTERNALLY:
-                    exata = build_exata_simulator(
-
+                    exata = create_exata_simulator(
                         working_directory=absolute_path,
-                    # executable_path=r"D:\Scalable\exata7.3.0.0\exata\7.3.0.0\bin\exata.exe",
-                    executable_path=r"D:\Exata\exata\7.3.0.0\bin\exata.exe",#xkz exata地址
                         config_file=f"{selected_scene_name}.config",
-                    # config_file="fina1.config"
-                )
+                    )
                     exata.stop_simulation()
                 #
                     exata.run_simulation()
@@ -6984,12 +7199,9 @@ class SocketView(View):
         print(f"chushihua场景文件夹绝对路径: {absolute_path}")
         if EXATA_MANAGED_EXTERNALLY:
             return {"status": "仿真已停止，EXATA 由外部宿主机管理"}
-        exata = ExataSimulator(
-
+        exata = create_exata_simulator(
             working_directory=absolute_path,
-            executable_path=r"D:\exata\exata\exata\7.3.0.0\bin\exata.exe",
             config_file=f"{selected_scene_name}.config",
-            # config_file="fina1.config"
         )
         exata.stop_simulation()
         script_path = EXATA_RESTART_SCRIPT
