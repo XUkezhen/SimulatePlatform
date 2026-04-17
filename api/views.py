@@ -94,6 +94,22 @@ def _get_scene_channel_data(scene):
     primary_channel_name = channel_names[0] if channel_names else 'Channel0'
     return channel_configs, channel_names, primary_channel_name
 
+
+def _normalize_yes_no_flag(value, field_name, default='YES'):
+    if value in (None, ''):
+        return default
+
+    if isinstance(value, bool):
+        return 'YES' if value else 'NO'
+
+    normalized_value = str(value).strip().upper()
+    if normalized_value in {'YES', 'TRUE', '1'}:
+        return 'YES'
+    if normalized_value in {'NO', 'FALSE', '0'}:
+        return 'NO'
+
+    raise ValueError(f'{field_name} must be YES or NO')
+
 @require_http_methods(["POST"])
 @csrf_exempt
 def add_scene_list(request):
@@ -112,10 +128,17 @@ def add_scene_list(request):
         simulation_step = data.get('simulationStep')
         channel_count = data.get('channelCount', 0)
         channel_configs = data.get('channelConfigs', [])
+        llc_enabled = _normalize_yes_no_flag(data.get('llcEnabled', data.get('LLC-ENABLED')), 'llcEnabled')
+        arp_enabled = _normalize_yes_no_flag(data.get('arpEnabled', data.get('ARP-ENABLED')), 'arpEnabled')
     except json.JSONDecodeError:
         return JsonResponse({
             'status': 'error',
             'message': 'Invalid JSON format'
+        }, status=400)
+    except ValueError as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': str(e)
         }, status=400)
 
     # 验证必要参数是否存在
@@ -180,7 +203,9 @@ def add_scene_list(request):
             endTime=end_time,
             simulationStep=simulation_step,
             channelCount=channel_count,
-            channelConfigs=channel_configs
+            channelConfigs=channel_configs,
+            llcEnabled=llc_enabled,
+            arpEnabled=arp_enabled
         )
 
         # 创建默认子网
@@ -263,6 +288,16 @@ def edit_scene_list(request, scene_id):
         new_simulation_step = int(data.get('simulationStep', scene.simulationStep))
         new_channel_count = data.get('channelCount', scene.channelCount)
         new_channel_configs = data.get('channelConfigs', scene.channelConfigs)
+        new_llc_enabled = _normalize_yes_no_flag(
+            data['llcEnabled'] if 'llcEnabled' in data else data.get('LLC-ENABLED', scene.llcEnabled),
+            'llcEnabled',
+            default=scene.llcEnabled,
+        )
+        new_arp_enabled = _normalize_yes_no_flag(
+            data['arpEnabled'] if 'arpEnabled' in data else data.get('ARP-ENABLED', scene.arpEnabled),
+            'arpEnabled',
+            default=scene.arpEnabled,
+        )
 
         # 验证场景名称是否重复
         if Scene.objects.exclude(id=scene_id).filter(sceneName=new_scene_name).exists():
@@ -294,6 +329,8 @@ def edit_scene_list(request, scene_id):
         scene.simulationStep = new_simulation_step
         scene.channelCount = new_channel_count
         scene.channelConfigs = new_channel_configs
+        scene.llcEnabled = new_llc_enabled
+        scene.arpEnabled = new_arp_enabled
         scene.save()
 
         return JsonResponse({'status': 'success'})
@@ -329,7 +366,9 @@ def get_scene_list(request):
         'endTime': scene.endTime.isoformat(),
         'simulationStep': scene.simulationStep,
         'channelCount': scene.channelCount,
-        'channelConfigs': scene.channelConfigs
+        'channelConfigs': scene.channelConfigs,
+        'llcEnabled': scene.llcEnabled,
+        'arpEnabled': scene.arpEnabled
     } for scene in page_obj]
 
     # 返回分页后的场景列表
@@ -3278,6 +3317,8 @@ def _build_export_context(scene):
         'scene': scene,
         'simulation_duration': int((scene.endTime - scene.startTime).total_seconds()),
         'num_nodes': nodes.count(),
+        'llc_enabled': scene.llcEnabled == 'YES',
+        'arp_enabled': scene.arpEnabled == 'YES',
         'nodes': nodes,
         'links': links,
         'satellites': Node.objects.filter(sceneId=scene, nodeType='satellite').order_by('id'),

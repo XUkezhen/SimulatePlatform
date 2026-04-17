@@ -23,12 +23,19 @@ from django.core.exceptions import ValidationError
 #6.10 下午，8002已全部更新完毕，下一步，子网配置
 #6.12上午，子网
 class Scene(models.Model):
+    YES_NO_CHOICES = [
+        ('YES', 'YES'),
+        ('NO', 'NO'),
+    ]
+
     sceneName = models.CharField(max_length=100)
     startTime = models.DateTimeField()
     endTime = models.DateTimeField()
     simulationStep = models.IntegerField()  # 新增仿真步长字段
     channelCount = models.IntegerField(default=0, verbose_name="信道数量")
     channelConfigs = models.JSONField(null=True, blank=True, default=list, verbose_name="信道配置列表")
+    llcEnabled = models.CharField(max_length=3, choices=YES_NO_CHOICES, default='YES', verbose_name="是否启用逻辑链路控制")
+    arpEnabled = models.CharField(max_length=3, choices=YES_NO_CHOICES, default='YES', verbose_name="是否启用地址解析协议")
     COORDINATE_CHOICES = [
         ('CARTESIAN', 'Cartesian'),#大写是写入数据库的，小写是展示用的
         ('LATLONALT', 'LatLonAlt'),

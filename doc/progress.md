@@ -1,5 +1,12 @@
 # Progress
 
+## æ¨¡æ¿
+
+- æ—¥æœŸï¼š
+- æ”¹åŠ¨ï¼š
+- æœ¬åœ°æäº¤ï¼š
+- å¤‡æ³¨ï¼š
+
 ## 2026-04-07
 - å»ºç«‹æœ¬åœ° Git checkpointã€‚
 - åˆ‡æ¢å¹¶ä½¿ç”¨æœ¬åœ° `main` åˆ†æ”¯åšåç»­å¼€å‘è®°å½•ã€‚
@@ -23,12 +30,7 @@
 - ä½ç½®ï¼šæ¨¡æ¿ç¬¬469-472è¡Œã€ç¬¬478-481è¡Œã€ç¬¬486-489è¡Œï¼ˆsub/link ç±»å‹æ¥å£ï¼‰ã€‚
 - æäº¤è¯´æ˜ï¼š`refactor: simplify routing config in exata template`
 
-## æ¨¡æ¿
 
-- æ—¥æœŸï¼š
-- æ”¹åŠ¨ï¼š
-- æœ¬åœ°æäº¤ï¼š
-- å¤‡æ³¨ï¼š
 
 ## 2026-04-16
 
@@ -81,3 +83,15 @@
   - åœºæ™¯ `.fault` å’Œ `link.txt` ä¹ŸåŒæ­¥æ”¹ä¸ºä½¿ç”¨æ˜ å°„åçš„é“¾è·¯/å­ç½‘ç¼–å·ï¼Œä¿è¯ä¸ `.config` ä¸€è‡´
   - å‰ç«¯ CRUD ä¸æŸ¥è¯¢æ¥å£ä»è¿”å›çœŸå®æ•°æ®åº“ä¸»é”®ï¼Œä»…å¯¼å‡ºæ–‡ä»¶ä½¿ç”¨è¿ç»­ç¼–å·
   - æäº¤è¯´æ˜ï¼š`refactor: map exported link and subnet ids sequentially`
+
+## 2026-04-17
+
+- ³¡¾°ĞÂÔö `llcEnabled`¡¢`arpEnabled` Á½¸öÅäÖÃÏî£¬È¡ÖµÎª `YES/NO`
+- Éú³É `.config` Ê±£¬ÔÚ `NUM-NODES {{ num_nodes }}` ÏÂ·½°´Ìõ¼şÊä³ö `LLC-ENABLED YES`¡¢`ARP-ENABLED YES`
+- µ±¶ÔÓ¦³¡¾°ÅäÖÃÎª `NO` Ê±£¬²»Ğ´Èë¶ÔÓ¦µÄ config ĞĞ
+- ³¡¾°ĞÂÔö¡¢±à¼­¡¢²éÑ¯½Ó¿ÚÒÑÖ§³ÖÕâÁ½¸ö×Ö¶Î£¬²¢¼æÈİ `LLC-ENABLED` / `ARP-ENABLED` ĞÎÊ½µÄÈë²Î
+- ĞÂÔöÇ¨ÒÆÎÄ¼ş£º`api/migrations/0019_scene_llcenabled_scene_arpenabled.py`
+- ±¾µØÑéÖ¤£º
+  `python manage.py check`
+  `python manage.py makemigrations --check --dry-run`
+  `python manage.py migrate`

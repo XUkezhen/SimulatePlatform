@@ -4,7 +4,7 @@ from django.core.exceptions import ValidationError
 class SceneForm(forms.ModelForm):
     class Meta:
         model = Scene
-        fields = ['sceneName', 'startTime', 'endTime','simulationStep', 'channelCount', 'channelConfigs']
+        fields = ['sceneName', 'startTime', 'endTime','simulationStep', 'channelCount', 'channelConfigs', 'llcEnabled', 'arpEnabled']
 
     def clean(self):
         # 调用父类的 clean 方法，确保其他字段的验证逻辑正常执行

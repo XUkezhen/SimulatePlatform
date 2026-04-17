@@ -10,6 +10,12 @@ MULTI-GUI-INTERFACE NO
 GUI-CONFIG-LOCKED NO
 DUMMY-GLOBAL-FILTER-ENABLE NO
 NUM-NODES {{ num_nodes }}
+{% if llc_enabled %}
+LLC-ENABLED YES
+{% endif %}
+{% if arp_enabled %}
+ARP-ENABLED YES
+{% endif %}
 
 #*******************Parallel Settings***********************************
 
