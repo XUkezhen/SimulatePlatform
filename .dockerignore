@@ -1,0 +1,8 @@
+.venv
+.uv-cache
+__pycache__
+*.pyc
+db.sqlite3
+tmp
+scene_files
+*.log
