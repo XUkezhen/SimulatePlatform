@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import Configuration
+from .models import Configuration, normalize_business_type
 
 
 def _parse_duration_seconds(value):
@@ -21,8 +21,14 @@ class ConfigurationSerializer(serializers.ModelSerializer):
         model = Configuration
         fields = '__all__'
 
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['businessType'] = normalize_business_type(data.get('businessType'))
+        return data
+
     def validate(self, data):
-        business_type = data.get('businessType')
+        business_type = normalize_business_type(data.get('businessType'))
+        data['businessType'] = business_type
         business_name = data.get('businessName')
 
         # 防止业务名称重复（注意更新时排除自身）
@@ -75,15 +81,15 @@ class ConfigurationSerializer(serializers.ModelSerializer):
             if not isinstance(server_list, list) or not server_list:
                 raise serializers.ValidationError("HTTP 类型必须提供非空的 serverList 列表。")
 
-        elif business_type == '泊松分布':
+        elif business_type == 'POISSON':
             required_fields = ['sourceNodeId', 'destinationNodeId', 'poissonStartTime', 'poissonEndTime', 'poissonMeanInterval', 'poissonPacketSize']
             start_time = data.get('poissonStartTime')
             end_time = data.get('poissonEndTime')
 
             if not data.get('sourceNodeId') or not data.get('destinationNodeId'):
-                raise serializers.ValidationError("泊松分布类型需要指定 sourceNodeId 和 destinationNodeId。")
+                raise serializers.ValidationError("POISSON 类型需要指定 sourceNodeId 和 destinationNodeId。")
 
-        elif business_type == '广播业务':
+        elif business_type == 'BROADCAST':
             required_fields = [
                 'sourceNodeId',
                 'broadcastDest',
@@ -99,9 +105,9 @@ class ConfigurationSerializer(serializers.ModelSerializer):
             end_time = None
 
             if not data.get('sourceNodeId'):
-                raise serializers.ValidationError("广播业务类型需要指定 sourceNodeId。")
+                raise serializers.ValidationError("BROADCAST 类型需要指定 sourceNodeId。")
 
-        elif business_type == '组播业务':
+        elif business_type == 'MULTICAST':
             required_fields = [
                 'sourceNodeId',
                 'multicastDestination',
@@ -115,7 +121,7 @@ class ConfigurationSerializer(serializers.ModelSerializer):
             end_time = data.get('multicastEndTime')
 
             if not data.get('sourceNodeId'):
-                raise serializers.ValidationError("组播业务类型需要指定 sourceNodeId。")
+                raise serializers.ValidationError("MULTICAST 类型需要指定 sourceNodeId。")
 
         else:
             raise serializers.ValidationError(f"不支持的业务类型: {business_type}")

@@ -48,13 +48,13 @@ Common request fields:
 - `businessType`: business type
 - `businessName`: unique business name
 - `sourceNodeId`: source node ID
-- `destinationNodeId`: destination node ID, required for unicast traffic such as `泊松分布`
+- `destinationNodeId`: destination node ID, required for unicast traffic such as `POISSON`
 
 For the new traffic types, time and interval fields should be sent as EXATA-style strings such as `1S`, `5S`, `20S`.
 
 ## Business types
 
-### 1. 泊松分布
+### 1. POISSON
 
 Required fields:
 
@@ -73,7 +73,7 @@ Example request:
 ```json
 {
   "sceneId": 1,
-  "businessType": "泊松分布",
+  "businessType": "POISSON",
   "businessName": "poisson-demo",
   "sourceNodeId": 1,
   "destinationNodeId": 2,
@@ -100,7 +100,7 @@ Mapping:
 - `<start_time>` -> `poissonStartTime`
 - `<end_time>` -> `poissonEndTime`
 
-### 2. 广播业务
+### 2. BROADCAST
 
 Required fields:
 
@@ -122,7 +122,7 @@ Example request:
 ```json
 {
   "sceneId": 1,
-  "businessType": "广播业务",
+  "businessType": "BROADCAST",
   "businessName": "broadcast-demo",
   "sourceNodeId": 1,
   "broadcastDest": "255.255.255.255",
@@ -154,7 +154,7 @@ Mapping:
 - `<fragment_size>` -> `broadcastFragmentSize`
 - `<fragment_num>` -> `broadcastFragmentNum`
 
-### 3. 组播业务
+### 3. MULTICAST
 
 Required fields:
 
@@ -174,7 +174,7 @@ Example request:
 ```json
 {
   "sceneId": 1,
-  "businessType": "组播业务",
+  "businessType": "MULTICAST",
   "businessName": "multicast-demo",
   "sourceNodeId": 1,
   "multicastDestination": "224.0.1.0",
@@ -212,7 +212,7 @@ Mapping:
   "data": {
     "id": 12,
     "sceneId": 1,
-    "businessType": "泊松分布",
+    "businessType": "POISSON",
     "businessName": "poisson-demo"
   }
 }

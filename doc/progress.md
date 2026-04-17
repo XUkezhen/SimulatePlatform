@@ -58,12 +58,12 @@
 - 本地提交：`f388bf9` (主要功能), `8db5bb6` (文档更新)
 
 - **新增业务类型与 `.app` 导出**
-  - `Configuration` 新增 3 类业务：`泊松分布`、`广播业务`、`组播业务`
+  - `Configuration` adds 3 business types: `POISSON`, `BROADCAST`, `MULTICAST`
   - 新增对应配置字段、列表返回字段、创建校验与编辑分支
   - `.app` 生成逻辑已支持导出以下 EXATA 格式：
-    - `泊松分布` -> `VBR <src> <dest> <packet_size> <mean_interval> <start_time> <end_time>`
-    - `广播业务` -> `MESSENGER-APP <src> <dest> <transport_type> <app_type> <life_time> <start_time> <interval> <fragment_size> <fragment_num>`
-    - `组播业务` -> `MCBR <src> <multicast-destination> <items-to-send> <item-size> <interval> <start-time> <end-time>`
+    - `POISSON` -> `VBR <src> <dest> <packet_size> <mean_interval> <start_time> <end_time>`
+    - `BROADCAST` -> `MESSENGER-APP <src> <dest> <transport_type> <app_type> <life_time> <start_time> <interval> <fragment_size> <fragment_num>`
+    - `MULTICAST` -> `MCBR <src> <multicast-destination> <items-to-send> <item-size> <interval> <start-time> <end-time>`
   - 新增文档：`doc/configuration_api.md`
 
 - **导出文件中的链路/子网 ID 改为连续映射**
@@ -86,12 +86,12 @@
 
 ## 2026-04-17
 
-- �������� `llcEnabled`��`arpEnabled` ���������ȡֵΪ `YES/NO`
-- ���� `.config` ʱ���� `NUM-NODES {{ num_nodes }}` �·���������� `LLC-ENABLED YES`��`ARP-ENABLED YES`
-- ����Ӧ��������Ϊ `NO` ʱ����д���Ӧ�� config ��
-- �����������༭����ѯ�ӿ���֧���������ֶΣ������� `LLC-ENABLED` / `ARP-ENABLED` ��ʽ�����
-- ����Ǩ���ļ���`api/migrations/0019_scene_llcenabled_scene_arpenabled.py`
-- ������֤��
+- 场景新增 `llcEnabled`、`arpEnabled` 两个配置项，取值为 `YES/NO`
+- 生成 `.config` 时，在 `NUM-NODES {{ num_nodes }}` 下方按条件输出 `LLC-ENABLED YES`、`ARP-ENABLED YES`
+- 当对应场景配置为 `NO` 时，不写入对应的 config 行
+- 场景新增、编辑、查询接口已支持这两个字段，并兼容 `LLC-ENABLED` / `ARP-ENABLED` 形式的入参
+- 新增迁移文件：`api/migrations/0019_scene_llcenabled_scene_arpenabled.py`
+- 本地验证：
   `python manage.py check`
   `python manage.py makemigrations --check --dry-run`
   `python manage.py migrate`

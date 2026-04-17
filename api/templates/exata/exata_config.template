@@ -429,6 +429,11 @@ LINK N8-{{ link.subnet.subnetIp }} { {{ node_id_map[link.sourceNodeId.id] }}, {{
 
 
 
+{% if static_route_nodes %}
+[{{ static_route_nodes | join(' ') }}] STATIC-ROUTE YES
+[{{ static_route_nodes | join(' ') }}] STATIC-ROUTE-FILE {{ static_route_file_path }}
+
+{% endif %}
 #************* Interface Configuration ***********************************
 {% for node in nodes %}{% for interface in node.interfaces.all() %}
 [{{ node_id_map[node.id] }}] NETWORK-PROTOCOL[{{ interface.interfaceIndex }}]       IP{% if interface.interfaceType == 'sub' %}

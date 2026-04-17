@@ -5,6 +5,28 @@ from django.utils import timezone
 from django.core.exceptions import ValidationError
 
 
+BUSINESS_TYPE_POISSON = 'POISSON'
+BUSINESS_TYPE_BROADCAST = 'BROADCAST'
+BUSINESS_TYPE_MULTICAST = 'MULTICAST'
+
+BUSINESS_TYPE_ALIAS_MAP = {
+    '泊松分布': BUSINESS_TYPE_POISSON,
+    '广播业务': BUSINESS_TYPE_BROADCAST,
+    '组播业务': BUSINESS_TYPE_MULTICAST,
+    BUSINESS_TYPE_POISSON: BUSINESS_TYPE_POISSON,
+    BUSINESS_TYPE_BROADCAST: BUSINESS_TYPE_BROADCAST,
+    BUSINESS_TYPE_MULTICAST: BUSINESS_TYPE_MULTICAST,
+}
+
+
+def normalize_business_type(value):
+    if value in [None, '']:
+        return value
+    text = str(value).strip()
+    upper_text = text.upper()
+    return BUSINESS_TYPE_ALIAS_MAP.get(text, BUSINESS_TYPE_ALIAS_MAP.get(upper_text, text))
+
+
 
 # 3.7号下午   本版本修改了node模型，接口模型未设置，链路模型没改。。
 # 3.9晚上9点，新建了接口模型，链路模型一并修改。
@@ -167,9 +189,9 @@ class Configuration(models.Model):
         ('FTP', 'FTP'),
         ('TRAFFIC-GEN', 'TRAFFIC-GEN'),
         ('HTTP', 'HTTP'),
-        ('泊松分布', '泊松分布'),
-        ('广播业务', '广播业务'),
-        ('组播业务', '组播业务'),
+        (BUSINESS_TYPE_POISSON, BUSINESS_TYPE_POISSON),
+        (BUSINESS_TYPE_BROADCAST, BUSINESS_TYPE_BROADCAST),
+        (BUSINESS_TYPE_MULTICAST, BUSINESS_TYPE_MULTICAST),
     )
 
     sceneId = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name='configurations', default=12)
@@ -245,6 +267,10 @@ class Configuration(models.Model):
     multicastInterval = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播发送间隔')
     multicastStartTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播启动时间')
     multicastEndTime = models.CharField(max_length=50, null=True, blank=True, verbose_name='组播结束时间')
+
+    def save(self, *args, **kwargs):
+        self.businessType = normalize_business_type(self.businessType)
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.businessType} - {self.businessName}'

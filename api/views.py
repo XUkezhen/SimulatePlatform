@@ -110,6 +110,129 @@ def _normalize_yes_no_flag(value, field_name, default='YES'):
 
     raise ValueError(f'{field_name} must be YES or NO')
 
+
+def _calculate_link_layer_azimuth(x1, y1, x2, y2):
+    dx = x2 - x1
+    dy = y2 - y1
+    azimuth = math.degrees(math.atan2(dx, dy))
+    return (azimuth + 360) % 360
+
+
+def _calculate_link_layer_elevation(x1, y1, z1, x2, y2, z2):
+    dx = x2 - x1
+    dy = y2 - y1
+    dz = z2 - z1
+    horizontal_distance = math.sqrt(dx ** 2 + dy ** 2)
+    return math.degrees(math.atan2(dz, horizontal_distance))
+
+
+def _parse_link_layer_groups(config_file: Path) -> List[set]:
+    connected_groups = []
+
+    with config_file.open('r', encoding='utf-8') as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not (line.startswith('SUBNET') or line.startswith('LINK ')):
+                continue
+
+            match = re.search(r'\{\s*([\d\s,]+)\s*\}', line)
+            if not match:
+                continue
+
+            nodes = [int(node_id.strip()) for node_id in match.group(1).split(',')]
+            connected_groups.append(set(nodes))
+
+    return connected_groups
+
+
+def _parse_link_layer_positions(nodes_file: Path) -> Dict[int, Tuple[float, float, float]]:
+    positions: Dict[int, Tuple[float, float, float]] = {}
+
+    with nodes_file.open('r', encoding='utf-8') as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            match = re.match(r'^(\d+)\s+\S+\s+\(([^)]+)\)', line)
+            if not match:
+                continue
+
+            node_id = int(match.group(1))
+            if node_id in positions:
+                continue
+
+            coord_parts = [part for part in re.split(r'[\s,]+', match.group(2).strip()) if part]
+            if len(coord_parts) != 3:
+                continue
+
+            positions[node_id] = tuple(float(value) for value in coord_parts)
+
+    return positions
+
+
+def _build_link_layer_data(config_file: Path, nodes_file: Path) -> List[Dict]:
+    connected_groups = _parse_link_layer_groups(config_file)
+    positions = _parse_link_layer_positions(nodes_file)
+    all_nodes = sorted(positions.keys())
+
+    results = []
+    for index, node1 in enumerate(all_nodes):
+        for node2 in all_nodes[index + 1:]:
+            is_neighbor = any(node1 in group and node2 in group for group in connected_groups)
+            pos1 = positions[node1]
+            pos2 = positions[node2]
+            azimuth1 = _calculate_link_layer_azimuth(pos1[0], pos1[1], pos2[0], pos2[1])
+            azimuth2 = _calculate_link_layer_azimuth(pos2[0], pos2[1], pos1[0], pos1[1])
+            elevation1 = _calculate_link_layer_elevation(pos1[0], pos1[1], pos1[2], pos2[0], pos2[1], pos2[2])
+            elevation2 = _calculate_link_layer_elevation(pos2[0], pos2[1], pos2[2], pos1[0], pos1[1], pos1[2])
+
+            results.append({
+                'Node1': node1,
+                'Node2': node2,
+                'Is_Neighbor': is_neighbor,
+                'Node1_Pos': f'({pos1[0]:.4f}, {pos1[1]:.4f}, {pos1[2]:.4f})',
+                'Node2_Pos': f'({pos2[0]:.4f}, {pos2[1]:.4f}, {pos2[2]:.4f})',
+                'Azimuth_1_to_2': round(azimuth1, 2),
+                'Azimuth_2_to_1': round(azimuth2, 2),
+                'Elevation_1_to_2': round(elevation1, 2),
+                'Elevation_2_to_1': round(elevation2, 2),
+            })
+
+    return results
+
+
+def _parse_link_relationships_file(file_path: Path) -> List[Dict]:
+    with file_path.open('r', encoding='utf-8') as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    if not lines:
+        return []
+
+    results = []
+    for line in lines[1:]:
+        parts = line.split('\t')
+        if len(parts) != 9:
+            continue
+
+        results.append({
+            'Node1': int(parts[0]),
+            'Node2': int(parts[1]),
+            'Is_Neighbor': parts[2].strip().lower() == 'true',
+            'Node1_Pos': parts[3],
+            'Node2_Pos': parts[4],
+            'Azimuth_1_to_2': float(parts[5]),
+            'Azimuth_2_to_1': float(parts[6]),
+            'Elevation_1_to_2': float(parts[7]),
+            'Elevation_2_to_1': float(parts[8]),
+        })
+
+    return results
+
+
+SCENE_LLC_API_KEY = 'LLC-ENABLED'
+SCENE_ARP_API_KEY = 'ARP-ENABLED'
+
 @require_http_methods(["POST"])
 @csrf_exempt
 def add_scene_list(request):
@@ -128,8 +251,8 @@ def add_scene_list(request):
         simulation_step = data.get('simulationStep')
         channel_count = data.get('channelCount', 0)
         channel_configs = data.get('channelConfigs', [])
-        llc_enabled = _normalize_yes_no_flag(data.get('llcEnabled', data.get('LLC-ENABLED')), 'llcEnabled')
-        arp_enabled = _normalize_yes_no_flag(data.get('arpEnabled', data.get('ARP-ENABLED')), 'arpEnabled')
+        llc_enabled = _normalize_yes_no_flag(data.get(SCENE_LLC_API_KEY, data.get('llcEnabled')), SCENE_LLC_API_KEY)
+        arp_enabled = _normalize_yes_no_flag(data.get(SCENE_ARP_API_KEY, data.get('arpEnabled')), SCENE_ARP_API_KEY)
     except json.JSONDecodeError:
         return JsonResponse({
             'status': 'error',
@@ -289,13 +412,13 @@ def edit_scene_list(request, scene_id):
         new_channel_count = data.get('channelCount', scene.channelCount)
         new_channel_configs = data.get('channelConfigs', scene.channelConfigs)
         new_llc_enabled = _normalize_yes_no_flag(
-            data['llcEnabled'] if 'llcEnabled' in data else data.get('LLC-ENABLED', scene.llcEnabled),
-            'llcEnabled',
+            data[SCENE_LLC_API_KEY] if SCENE_LLC_API_KEY in data else data.get('llcEnabled', scene.llcEnabled),
+            SCENE_LLC_API_KEY,
             default=scene.llcEnabled,
         )
         new_arp_enabled = _normalize_yes_no_flag(
-            data['arpEnabled'] if 'arpEnabled' in data else data.get('ARP-ENABLED', scene.arpEnabled),
-            'arpEnabled',
+            data[SCENE_ARP_API_KEY] if SCENE_ARP_API_KEY in data else data.get('arpEnabled', scene.arpEnabled),
+            SCENE_ARP_API_KEY,
             default=scene.arpEnabled,
         )
 
@@ -367,8 +490,8 @@ def get_scene_list(request):
         'simulationStep': scene.simulationStep,
         'channelCount': scene.channelCount,
         'channelConfigs': scene.channelConfigs,
-        'llcEnabled': scene.llcEnabled,
-        'arpEnabled': scene.arpEnabled
+        SCENE_LLC_API_KEY: scene.llcEnabled,
+        SCENE_ARP_API_KEY: scene.arpEnabled
     } for scene in page_obj]
 
     # 返回分页后的场景列表
@@ -1731,6 +1854,7 @@ def get_configuration_list(request):
     source_node_name = request.GET.get('sourceNodeName', '')
     destination_node_name = request.GET.get('destinationNodeName', '')
     business_type = request.GET.get('businessType', '')
+    normalized_business_type = normalize_business_type(business_type)
     scene_id = request.GET.get('sceneId', '')
 
     # 构建查询条件
@@ -1742,7 +1866,10 @@ def get_configuration_list(request):
     if destination_node_name:
         query &= Q(destinationNodeId__nodeName__icontains=destination_node_name)
     if business_type:
-        query &= Q(businessType__icontains=business_type)
+        query &= (
+            Q(businessType__icontains=business_type) |
+            Q(businessType__icontains=normalized_business_type)
+        )
     if scene_id:
         query &= Q(sceneId=scene_id)
 
@@ -1795,7 +1922,7 @@ def get_configuration_list(request):
         'multicastInterval': config.multicastInterval,
         'multicastStartTime': config.multicastStartTime,
         'multicastEndTime': config.multicastEndTime,
-        'businessType': config.businessType
+        'businessType': normalize_business_type(config.businessType)
     } for config in page_obj]
 
     return JsonResponse({
@@ -1830,7 +1957,7 @@ def edit_configuration_list(request, configuration_id):
         config.destinationNodeId = Node.objects.get(id=destination_node_id)
 
     # 不允许修改 businessType，只使用原有值判断更新内容
-    business_type = config.businessType.upper()
+    business_type = normalize_business_type(config.businessType)
 
     if business_type == 'CBR':
         config.cbrStartTime = data.get('cbrStartTime', config.cbrStartTime)
@@ -1861,13 +1988,13 @@ def edit_configuration_list(request, configuration_id):
         config.httpStartTime = data.get('httpStartTime', config.httpStartTime)
         config.httpThreshTime = data.get('httpThreshTime', config.httpThreshTime)
 
-    elif business_type == '泊松分布':
+    elif business_type == 'POISSON':
         config.poissonStartTime = data.get('poissonStartTime', config.poissonStartTime)
         config.poissonEndTime = data.get('poissonEndTime', config.poissonEndTime)
         config.poissonMeanInterval = data.get('poissonMeanInterval', config.poissonMeanInterval)
         config.poissonPacketSize = data.get('poissonPacketSize', config.poissonPacketSize)
 
-    elif business_type == '广播业务':
+    elif business_type == 'BROADCAST':
         config.broadcastDest = data.get('broadcastDest', config.broadcastDest)
         config.broadcastTransportType = data.get('broadcastTransportType', config.broadcastTransportType)
         config.broadcastAppType = data.get('broadcastAppType', config.broadcastAppType)
@@ -1877,7 +2004,7 @@ def edit_configuration_list(request, configuration_id):
         config.broadcastFragmentSize = data.get('broadcastFragmentSize', config.broadcastFragmentSize)
         config.broadcastFragmentNum = data.get('broadcastFragmentNum', config.broadcastFragmentNum)
 
-    elif business_type == '组播业务':
+    elif business_type == 'MULTICAST':
         config.multicastDestination = data.get('multicastDestination', config.multicastDestination)
         config.multicastItemsToSend = data.get('multicastItemsToSend', config.multicastItemsToSend)
         config.multicastItemSize = data.get('multicastItemSize', config.multicastItemSize)
@@ -3266,6 +3393,122 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+STATIC_ROUTE_PROTOCOL = 'NONE'
+STATIC_ROUTE_UPLOAD_FIELD = 'STATIC-ROUTE'
+STATIC_ROUTE_FOLDER_NAME = 'staticroute'
+
+
+def _parse_interface_detail_json(detail):
+    if isinstance(detail, dict):
+        return detail
+    if isinstance(detail, str):
+        try:
+            parsed = json.loads(detail)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _get_interface_routing_protocol(interface):
+    detail = _parse_interface_detail_json(interface.detail)
+    routing_detail = detail.get('Routing', {})
+    if not isinstance(routing_detail, dict):
+        return ''
+
+    value = routing_detail.get('ROUTING-PROTOCOL-IPv4')
+    if value in (None, ''):
+        value = routing_detail.get('RoutingProtocolIPv4')
+    if value in (None, ''):
+        return ''
+    return str(value).strip()
+
+
+def _resolve_scene_folder_path(scene):
+    scene_root = _get_scene_files_root().resolve(strict=False)
+    scene_folder = (scene_root / scene.sceneName).resolve(strict=False)
+
+    try:
+        scene_folder.relative_to(scene_root)
+    except ValueError as exc:
+        raise ValueError(f'非法场景目录: {scene.sceneName}') from exc
+
+    return scene_folder
+
+
+def _resolve_static_route_directory(scene, create=False):
+    scene_folder = _resolve_scene_folder_path(scene)
+    static_route_dir = (scene_folder / STATIC_ROUTE_FOLDER_NAME).resolve(strict=False)
+
+    try:
+        static_route_dir.relative_to(scene_folder)
+    except ValueError as exc:
+        raise ValueError(f'非法静态路由目录: {scene.sceneName}') from exc
+
+    if create:
+        static_route_dir.mkdir(parents=True, exist_ok=True)
+
+    return static_route_dir
+
+
+def _resolve_static_route_file(scene, require_exists=False):
+    static_route_dir = _resolve_static_route_directory(scene, create=False)
+    if not static_route_dir.exists() or not static_route_dir.is_dir():
+        if require_exists:
+            raise FileNotFoundError(f'场景 {scene.sceneName} 未上传静态路由文件')
+        return None
+
+    matched_files = sorted(
+        path.resolve(strict=False)
+        for path in static_route_dir.iterdir()
+        if path.is_file()
+    )
+
+    if not matched_files:
+        if require_exists:
+            raise FileNotFoundError(f'场景 {scene.sceneName} 未上传静态路由文件')
+        return None
+
+    if len(matched_files) > 1:
+        raise ValueError(f'场景 {scene.sceneName} 的静态路由目录下存在多个文件，请仅保留一份')
+
+    return matched_files[0]
+
+
+def _build_static_route_export_data(scene, nodes, node_id_map):
+    static_route_node_ids = []
+    mixed_protocol_nodes = []
+
+    for node in nodes:
+        interfaces = list(node.interfaces.all())
+        if not interfaces:
+            continue
+
+        effective_protocols = set()
+        for interface in interfaces:
+            routing_protocol = _get_interface_routing_protocol(interface)
+            normalized_protocol = routing_protocol.upper() if routing_protocol else 'BELLMANFORD'
+            effective_protocols.add(normalized_protocol)
+
+        if STATIC_ROUTE_PROTOCOL in effective_protocols:
+            if len(effective_protocols) > 1:
+                mixed_protocol_nodes.append(node.nodeName or str(node.id))
+                continue
+            static_route_node_ids.append(node.id)
+
+    if mixed_protocol_nodes:
+        raise ValueError(
+            '以下节点同时存在 NONE 和其他路由协议，无法按节点级输出 STATIC-ROUTE: '
+            + ', '.join(mixed_protocol_nodes)
+        )
+
+    if not static_route_node_ids:
+        return [], None
+
+    static_route_file = _resolve_static_route_file(scene, require_exists=True)
+    exported_node_ids = sorted(node_id_map[node_id] for node_id in static_route_node_ids)
+    return exported_node_ids, static_route_file.resolve(strict=False).as_posix()
+
 
 @lru_cache(maxsize=1)
 def _get_exata_template_environment():
@@ -3281,7 +3524,7 @@ def _build_sequential_id_map(objects):
 
 
 def _build_export_context(scene):
-    nodes = Node.objects.filter(sceneId=scene).order_by('id').prefetch_related('interfaces')
+    nodes = list(Node.objects.filter(sceneId=scene).order_by('id').prefetch_related('interfaces'))
     links = Link.objects.filter(sceneId=scene).order_by('id').select_related(
         'sourceInterface',
         'destinationInterface',
@@ -3305,18 +3548,19 @@ def _build_export_context(scene):
             .values_list('id', flat=True)
         )
 
-    node_id_map = _build_sequential_id_map(list(nodes))
+    node_id_map = _build_sequential_id_map(nodes)
     link_id_map = _build_sequential_id_map(list(links))
     subnet_id_map = _build_sequential_id_map(list(all_subnets))
     channel_configs, _, primary_channel_name = _get_scene_channel_data(scene)
     errors = Error.objects.filter(sceneId=scene).order_by('id')
     has_app_data = Configuration.objects.filter(sceneId=scene).exists()
     has_fault_data = LinkError.objects.filter(sceneId=scene).exists() or errors.exists()
+    static_route_nodes, static_route_file_path = _build_static_route_export_data(scene, nodes, node_id_map)
 
     return {
         'scene': scene,
         'simulation_duration': int((scene.endTime - scene.startTime).total_seconds()),
-        'num_nodes': nodes.count(),
+        'num_nodes': len(nodes),
         'llc_enabled': scene.llcEnabled == 'YES',
         'arp_enabled': scene.arpEnabled == 'YES',
         'nodes': nodes,
@@ -3334,6 +3578,8 @@ def _build_export_context(scene):
         'include_fault_config': has_fault_data,
         'channel_configs': channel_configs,
         'primary_channel_name': primary_channel_name,
+        'static_route_nodes': static_route_nodes,
+        'static_route_file_path': static_route_file_path,
     }
 
 
@@ -3377,6 +3623,8 @@ def generate_exata_config(request):
         response['Content-Disposition'] = f'attachment; filename="{scene.sceneName}.config"'
         return response
 
+    except (ValueError, FileNotFoundError) as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
     except Exception as e:
         logger.error(f'Error generating Exata config: {str(e)}', exc_info=True)
         return HttpResponse(f'Error generating Exata config: {str(e)}', status=500)
@@ -3688,7 +3936,10 @@ def download_all_files(request):
         except Exception as e:
             print(f"删除文件失败 {file_path}: {e}")
 
-    export_context = _build_export_context(scene)
+    try:
+        export_context = _build_export_context(scene)
+    except (ValueError, FileNotFoundError) as e:
+        return HttpResponse(f'Error generating export context: {str(e)}', status=400)
     links = export_context['links']
     satellites = export_context['satellites']
     normal_nodes = export_context['normal_nodes']
@@ -3890,7 +4141,9 @@ def generate_scene_app_content(scene,node_id_map):
     configurations = Configuration.objects.filter(sceneId=scene)
     content = ""
     for config in configurations:
-        if config.businessType == 'CBR':
+        business_type = normalize_business_type(config.businessType)
+
+        if business_type == 'CBR':
             start_time = config.cbrStartTime
             end_time = config.cbrEndTime
             packet_size = config.cbrPacketSize
@@ -3911,7 +4164,7 @@ def generate_scene_app_content(scene,node_id_map):
             config_line += "\n"
             content += config_line
 
-        elif config.businessType == 'FTP':
+        elif business_type == 'FTP':
             start_time = config.ftpStartTime
             time_offset = (start_time - scene.startTime).total_seconds() if start_time else 0
             packet_count = config.ftpPacketCount
@@ -3919,11 +4172,11 @@ def generate_scene_app_content(scene,node_id_map):
             config_line = f"{config.businessType} {node_id_map[config.sourceNodeId.id]} {node_id_map[config.destinationNodeId.id]} {packet_count} {int(time_offset)}\n"
             content += config_line
 
-        elif config.businessType == 'TRAFFIC-GEN':
+        elif business_type == 'TRAFFIC-GEN':
             config_line = f"{config.businessType} {node_id_map[config.sourceNodeId.id]} {node_id_map[config.destinationNodeId.id]} DET {config.tgStartTime} DET {config.tgDurationTime} RND DET {config.tgPacketSize} DET {config.tgSendInterval} 1.0 NOLB\n"
             content += config_line
 
-        elif config.businessType == 'HTTP':
+        elif business_type == 'HTTP':
             num_servers = len(config.serverList) if config.serverList else 0
             server_ids_str = ' '.join(str(node_id_map[sid]) for sid in config.serverList) if config.serverList else ''
             config_line = f"{config.businessType} {node_id_map[config.clientId.id]} {num_servers} {server_ids_str} {config.httpStartTime} {config.httpThreshTime}\n"
@@ -3934,7 +4187,7 @@ def generate_scene_app_content(scene,node_id_map):
                 for server_id in config.serverList:
                     content += f"HTTPD {node_id_map[server_id]}\n"
 
-        elif config.businessType == '泊松分布':
+        elif business_type == 'POISSON':
             config_line = (
                 f"VBR {node_id_map[config.sourceNodeId.id]} "
                 f"{node_id_map[config.destinationNodeId.id]} {config.poissonPacketSize} "
@@ -3942,7 +4195,7 @@ def generate_scene_app_content(scene,node_id_map):
             )
             content += config_line
 
-        elif config.businessType == '广播业务':
+        elif business_type == 'BROADCAST':
             config_line = (
                 f"MESSENGER-APP {node_id_map[config.sourceNodeId.id]} {config.broadcastDest} "
                 f"{config.broadcastTransportType} {config.broadcastAppType} "
@@ -3952,7 +4205,7 @@ def generate_scene_app_content(scene,node_id_map):
             )
             content += config_line
 
-        elif config.businessType == '组播业务':
+        elif business_type == 'MULTICAST':
             config_line = (
                 f"MCBR {node_id_map[config.sourceNodeId.id]} {config.multicastDestination} "
                 f"{config.multicastItemsToSend} {config.multicastItemSize} "
@@ -4673,6 +4926,75 @@ def _resolve_scene_data_file(scene_folder, scene_name, suffix):
     return matched_files[0], None
 
 
+@require_http_methods(["POST"])
+@csrf_exempt
+def upload_scene_static_route(request):
+    scene_id = request.POST.get('sceneId') or request.GET.get('sceneId')
+    if not scene_id:
+        return JsonResponse({
+            'status': 'error',
+            'message': '缺少 sceneId 参数'
+        }, status=400)
+
+    uploaded_file = request.FILES.get(STATIC_ROUTE_UPLOAD_FIELD)
+    if uploaded_file is None:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'缺少上传文件字段 {STATIC_ROUTE_UPLOAD_FIELD}'
+        }, status=400)
+
+    try:
+        scene = Scene.objects.get(id=scene_id)
+    except Scene.DoesNotExist:
+        return JsonResponse({
+            'status': 'error',
+            'message': f'场景ID {scene_id} 不存在'
+        }, status=404)
+
+    try:
+        scene_folder = _resolve_scene_folder_path(scene)
+        scene_folder.mkdir(parents=True, exist_ok=True)
+        static_route_dir = _resolve_static_route_directory(scene, create=True)
+    except ValueError as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': str(e)
+        }, status=400)
+
+    safe_file_name = Path(uploaded_file.name).name.strip()
+    if not safe_file_name:
+        return JsonResponse({
+            'status': 'error',
+            'message': '上传文件名不能为空'
+        }, status=400)
+
+    for existing_file in static_route_dir.iterdir():
+        if existing_file.is_file() or existing_file.is_symlink():
+            existing_file.unlink()
+
+    target_file = (static_route_dir / safe_file_name).resolve(strict=False)
+    try:
+        target_file.relative_to(static_route_dir)
+    except ValueError:
+        return JsonResponse({
+            'status': 'error',
+            'message': '静态路由文件路径非法'
+        }, status=400)
+
+    with target_file.open('wb+') as destination:
+        for chunk in uploaded_file.chunks():
+            destination.write(chunk)
+
+    return JsonResponse({
+        'status': 'success',
+        'sceneId': scene.id,
+        'sceneName': scene.sceneName,
+        'fileName': target_file.name,
+        'relativePath': f'{STATIC_ROUTE_FOLDER_NAME}/{target_file.name}',
+        'absolutePath': target_file.as_posix(),
+    }, json_dumps_params={'ensure_ascii': False})
+
+
 @require_http_methods(["GET"])
 @csrf_exempt
 def get_rx_power_log(request):
@@ -4754,6 +5076,22 @@ def get_link_layer_data(request):
     if error_response:
         return error_response
 
+    link_relationships_file = scene_folder / 'link_relationships.txt'
+    if link_relationships_file.exists() and link_relationships_file.is_file():
+        try:
+            file_result = _parse_link_relationships_file(link_relationships_file)
+            if file_result:
+                return JsonResponse({
+                    'status': 'success',
+                    'sceneId': scene.id,
+                    'sceneName': scene.sceneName,
+                    'dataFile': link_relationships_file.name,
+                    'dataSource': 'link_relationships.txt',
+                    'data': file_result
+                }, json_dumps_params={'ensure_ascii': False})
+        except Exception:
+            pass
+
     config_file, error_response = _resolve_scene_data_file(scene_folder, scene.sceneName, '.config')
     if error_response:
         return error_response
@@ -4764,6 +5102,8 @@ def get_link_layer_data(request):
 
     try:
         result = process_link_relationships(str(config_file), str(nodes_file))
+        if not result:
+            result = _build_link_layer_data(config_file, nodes_file)
     except Exception as e:
         return JsonResponse({
             'status': 'error',
@@ -4776,6 +5116,7 @@ def get_link_layer_data(request):
         'sceneName': scene.sceneName,
         'configFile': config_file.name,
         'nodesFile': nodes_file.name,
+        'dataSource': 'generated',
         'data': result
     }, json_dumps_params={'ensure_ascii': False})
 
