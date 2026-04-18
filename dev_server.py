@@ -7,13 +7,14 @@ from django.utils.autoreload import run_with_reloader
 
 
 def run_daphne():
-    port = os.getenv("BACKEND_PORT", "8001")
+    host = os.getenv("BACKEND_HOST", "127.0.0.1")
+    port = os.getenv("BACKEND_PORT", "8002")
     command = [
         sys.executable,
         "-m",
         "daphne",
         "-b",
-        "0.0.0.0",
+        host,
         "-p",
         port,
         "mytest.asgi:application",

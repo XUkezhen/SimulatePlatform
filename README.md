@@ -1,24 +1,19 @@
-# mytestdjango_five_final
+# Backend Host Runtime
 
-This repository is ready to work with `uv` so teammates can clone it and create the same Python environment locally.
+This backend now targets Windows host execution instead of Docker. Use the local
+virtual environment created by `uv`, and manage the process with PM2 from the
+repository root.
 
 ## Requirements
 
 - Python `3.13`
-- `uv` installed on your machine
+- `uv`
+- `pm2`
+- A local EXATA installation available on the host machine
 
-Install `uv`:
+## First-Time Setup
 
-- Windows PowerShell: `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`
-- Or with pip: `pip install uv`
-
-Official docs:
-
-- https://docs.astral.sh/uv/
-
-## First-time setup
-
-Clone the repository, then run:
+From [`backend`](E:/0-CodeVault/satelliteNetworkSystem/backend):
 
 ```powershell
 uv sync
@@ -31,44 +26,41 @@ If you need a superuser:
 uv run python manage.py createsuperuser
 ```
 
-## Run the project
+## Runtime Configuration
 
-Development server:
+The backend reads the repository root [`.env`](E:/0-CodeVault/satelliteNetworkSystem/.env).
+For host execution, the expected defaults are:
 
-```powershell
-uv run python manage.py runserver
+```env
+BACKEND_HOST=127.0.0.1
+BACKEND_PORT=8002
+EXATA_MANAGED_EXTERNALLY=false
+EXATA_SERVICE_HOST=127.0.0.1
+EXATA_SERVICE_PORT=8005
+EXATA_EXECUTABLE_PATH=E:\path\to\exata.exe
+EXATA_RESTART_SCRIPT=restart_backend_pm2.bat
 ```
 
-ASGI server with Daphne:
+## PM2 Commands
+
+From the repository root:
 
 ```powershell
-uv run daphne -b 0.0.0.0 -p 8000 mytest.asgi:application
+pm2 start ecosystem.config.js
+pm2 status
+pm2 logs backend
+pm2 logs frontend
+pm2 restart backend
+pm2 restart frontend
 ```
 
-## Common workflow for collaborators
-
-After pulling the latest code:
-
-```powershell
-uv sync
-uv run python manage.py migrate
-```
-
-When dependencies change:
-
-```powershell
-uv lock
-uv sync
-```
-
-Then commit both of these files if they changed:
-
-- `pyproject.toml`
-- `uv.lock`
+The backend process uses [`dev_server.py`](E:/0-CodeVault/satelliteNetworkSystem/backend/dev_server.py),
+which starts Daphne with `BACKEND_HOST` and `BACKEND_PORT`.
 
 ## Notes
 
-- The local virtual environment `.venv/` should not be committed.
-- `db.sqlite3` is ignored, so each collaborator can keep a local database.
-- Some features appear to depend on a local EXATA installation. That executable is not managed by `uv`; teammates will still need their own EXATA install and may need to adjust the hard-coded path in the code.
-- `requirements.txt` is kept for reference, but `pyproject.toml` should be treated as the source of truth for dependencies.
+- `db.sqlite3` remains local and should not be committed.
+- EXATA is now launched directly by the host backend process.
+- `restart_daphne.bat` is kept only as a compatibility wrapper and now delegates
+  to `restart_backend_pm2.bat`.
+- Docker is no longer the primary runtime path for this backend.
