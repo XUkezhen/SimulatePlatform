@@ -21,6 +21,7 @@ path('connect/', SocketView.as_view(), name='connect'),
     path('api/deleteSceneList/<int:scene_id>', views.delete_scene_list, name='delete_scene_list'),#name用来重定向，reverse()
     path('api/editSceneList/<int:scene_id>', views.edit_scene_list, name='edit_scene_list'),
     path('api/getSceneList', views.get_scene_list, name='get_scene_list'),
+    path('api/getRuntimeLogs', views.get_runtime_logs, name='get_runtime_logs'),
     path('api/addSubnetList', views.add_subnet_list, name='add_subnet_list'),
     path('api/getSubnetList', views.get_subnet_list, name='get_subnet_list'),
     path('api/deleteSubnetList/<int:subnet_id>', views.delete_subnet_list, name='delete_subnet_list'),

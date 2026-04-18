@@ -1,4 +1,8 @@
+from datetime import datetime
+
+from django.utils import timezone
 from rest_framework import serializers
+
 from .models import Configuration, normalize_business_type
 
 
@@ -16,6 +20,26 @@ def _parse_duration_seconds(value):
     return float(text)
 
 
+def _coerce_scene_datetime(value):
+    if value in [None, '']:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
+
+
+def _validate_scene_datetime_bounds(scene, value, field_name):
+    parsed = _coerce_scene_datetime(value)
+    if parsed is None or scene is None:
+        return
+    if parsed < scene.startTime or parsed > scene.endTime:
+        raise serializers.ValidationError(f"{field_name} must fall within the scene time range.")
+
+
 class ConfigurationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Configuration
@@ -30,6 +54,7 @@ class ConfigurationSerializer(serializers.ModelSerializer):
         business_type = normalize_business_type(data.get('businessType'))
         data['businessType'] = business_type
         business_name = data.get('businessName')
+        scene = data.get('sceneId') or getattr(self.instance, 'sceneId', None)
 
         # 防止业务名称重复（注意更新时排除自身）
         if self.instance:
@@ -134,6 +159,16 @@ class ConfigurationSerializer(serializers.ModelSerializer):
             except (TypeError, ValueError):
                 if start_time >= end_time:
                     raise serializers.ValidationError("开始时间必须早于结束时间。")
+        if business_type == 'CBR':
+            _validate_scene_datetime_bounds(scene, start_time, 'cbrStartTime')
+            _validate_scene_datetime_bounds(scene, end_time, 'cbrEndTime')
+        elif business_type == 'FTP':
+            _validate_scene_datetime_bounds(scene, start_time, 'ftpStartTime')
+        elif business_type == 'TRAFFIC-GEN':
+            _validate_scene_datetime_bounds(scene, start_time, 'tgStartTime')
+        elif business_type == 'HTTP':
+            _validate_scene_datetime_bounds(scene, start_time, 'httpStartTime')
+
 
         # 检查必填字段是否存在
         missing_fields = [field for field in required_fields if data.get(field) in [None, '']]
