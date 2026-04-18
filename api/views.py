@@ -5222,6 +5222,36 @@ def _get_scene_files_root():
         return Path(settings.MEDIA_ROOT) / 'scene_files'
     return Path(settings.BASE_DIR) / 'scene_files'
 
+def _resolve_scene_runtime_context(scene_id):
+    try:
+        normalized_scene_id = int(scene_id)
+    except (TypeError, ValueError):
+        return None, None, None, JsonResponse({
+            'status': 'error',
+            'message': 'sceneId 必须是整数'
+        }, status=400)
+
+    try:
+        scene = Scene.objects.get(id=normalized_scene_id)
+    except Scene.DoesNotExist:
+        return None, None, None, JsonResponse({
+            'status': 'error',
+            'message': f'场景ID {normalized_scene_id} 不存在'
+        }, status=404)
+
+    scene_root = _get_scene_files_root().resolve(strict=False)
+    scene_folder = (scene_root / scene.sceneName).resolve(strict=False)
+
+    try:
+        scene_folder.relative_to(scene_root)
+    except ValueError:
+        return None, None, None, JsonResponse({
+            'status': 'error',
+            'message': '场景目录非法'
+        }, status=400)
+
+    return normalized_scene_id, scene, scene_folder, None
+
 
 def _read_scene_text_file(scene_id, file_name):
     try:
@@ -5639,7 +5669,6 @@ def start_simulation(request):
     global absolute_path
     global selected_scene_name
     try:
-        # 解析JSON请求体
         data = json.loads(request.body)
         scene_id = data.get('sceneId')
 
@@ -5649,38 +5678,18 @@ def start_simulation(request):
                 'message': '缺少场景ID参数'
             }, status=400)
 
-        try:
-            # 获取场景对象
-            scene = Scene.objects.get(id=scene_id)
-            selected_scene_name = scene.sceneName
-        except Scene.DoesNotExist:
-            return JsonResponse({
-                'status': 'error',
-                'message': f'场景ID {scene_id} 不存在'
-            }, status=404)
+        _, scene, scene_folder, error_response = _resolve_scene_runtime_context(scene_id)
+        if error_response:
+            return error_response
 
-        # ====== 新增功能：获取并打印场景文件夹绝对路径 ======
-        # 构建场景文件夹路径
-        scene_folder = os.path.join(
-            settings.MEDIA_ROOT,
-            'scene_files',
-            scene.sceneName  # 使用场景名称作为文件夹名
-            # 'fina1'
-        )
-
-        # path = r"C:\Users\lyk\Desktop\zuixinban\mytestdjango_five\scene1"
-        # absolute_path = Path(path)
-        # 获取绝对路径并打印
-        absolute_path_str = os.path.abspath(scene_folder)
-        # absolute_path =r"C:\Users\xukz1\Desktop\scene1\scene1"
-        absolute_path = Path(absolute_path_str)
+        selected_scene_name = scene.sceneName
+        absolute_path = scene_folder
         print(type(absolute_path))
         print(f"场景文件夹绝对路径: {absolute_path}")
-        # ====== 新增功能结束 ======
-
-        # 添加成功响应（可选：在响应中包含路径信息）
         return JsonResponse({
-            'status': 'success'
+            'status': 'success',
+            'sceneId': scene.id,
+            'sceneName': scene.sceneName,
         })
     except json.JSONDecodeError:
         return JsonResponse({
@@ -6939,9 +6948,16 @@ class SocketView(View):
                 print(f"接收失败: {e}")
                 break
 
-    def _handle_connect_request(self):
+    def _handle_connect_request(self, scene_id=None):
         global absolute_path
         global selected_scene_name
+
+        if scene_id not in (None, ''):
+            _, scene, scene_folder, error_response = _resolve_scene_runtime_context(scene_id)
+            if error_response:
+                return error_response
+            selected_scene_name = scene.sceneName
+            absolute_path = scene_folder
 
         SocketView.startSign = False
         SocketView.initial_k = 1
@@ -7051,7 +7067,7 @@ class SocketView(View):
         if content_type == 'application/json':
             data = json.loads(request.body)
             if 'connect' in data:
-                return self._handle_connect_request()
+                return self._handle_connect_request(data.get('sceneId'))
                 SocketView.startSign = False
                 # 在仿真开始时，把消息队列设置为空
                 # sendtofrontbysocket(request, "web socket 已经建立", "", "")
