@@ -1475,6 +1475,66 @@ def _parse_datetime_input(value, field_name):
             raise ValidationError(f"{field_name} 时间格式无效")
     raise ValidationError(f"{field_name} 时间格式无效")
 
+def _validate_scene_datetime_bounds(scene, value, field_name):
+    if scene is None or value is None:
+        return
+    if value < scene.startTime or value > scene.endTime:
+        raise ValidationError(f'{field_name} must fall within the scene time range')
+
+
+def _validate_scene_time_window(scene, start_time, end_time, start_field_name, end_field_name):
+    if start_time >= end_time:
+        raise ValidationError(f'{start_field_name} must be earlier than {end_field_name}')
+    _validate_scene_datetime_bounds(scene, start_time, start_field_name)
+    _validate_scene_datetime_bounds(scene, end_time, end_field_name)
+
+
+def _normalize_via_points(scene, start_time, via_points):
+    if via_points in [None, '']:
+        return []
+    if not isinstance(via_points, list):
+        raise ValidationError('viaPoints must be a list')
+
+    normalized_points = []
+    previous_time = start_time
+    for index, point in enumerate(via_points):
+        if not isinstance(point, dict):
+            raise ValidationError(f'viaPoints[{index}] must be an object')
+
+        missing_keys = [key for key in ['lon', 'lat', 'alt', 'time'] if key not in point]
+        if missing_keys:
+            raise ValidationError(f'viaPoints[{index}] is missing fields: {", ".join(missing_keys)}')
+
+        point_time = _parse_scene_datetime(point.get('time'), f'viaPoints[{index}].time')
+        _validate_scene_datetime_bounds(scene, point_time, f'viaPoints[{index}].time')
+        if point_time <= previous_time:
+            raise ValidationError('viaPoints time must be strictly increasing and later than startTime')
+
+        normalized_points.append({
+            'lon': point.get('lon'),
+            'lat': point.get('lat'),
+            'alt': point.get('alt'),
+            'time': point_time.isoformat(),
+        })
+        previous_time = point_time
+
+    return normalized_points
+
+
+def _validate_node_timeline(scene, start_time_value, via_points):
+    start_time = _parse_scene_datetime(start_time_value, 'startTime')
+    _validate_scene_datetime_bounds(scene, start_time, 'startTime')
+    normalized_points = _normalize_via_points(scene, start_time, via_points)
+    return start_time, normalized_points
+
+
+def _parse_error_window(scene, start_time_value, end_time_value):
+    start_time = _parse_scene_datetime(start_time_value, 'errorStartTime')
+    end_time = _parse_scene_datetime(end_time_value, 'errorEndTime')
+    _validate_scene_time_window(scene, start_time, end_time, 'errorStartTime', 'errorEndTime')
+    return start_time, end_time
+
+
 
 def _parse_float_input(value, field_name):
     if value in [None, '']:
@@ -1589,21 +1649,16 @@ def calculate_leo_via_points(request):
 @require_http_methods(["POST"])
 def add_node_list(request):
     try:
-        # 明确解码并验证 JSON 格式
         try:
-            body_unicode = request.body.decode('utf-8')  # 避免乱码问题
+            body_unicode = request.body.decode('utf-8')
             data = json.loads(body_unicode)
         except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            return JsonResponse({'status': 'error', 'message': f'无效的JSON格式: {str(e)}'}, status=400)
+            return JsonResponse({'status': 'error', 'message': f'Invalid JSON format: {str(e)}'}, status=400)
 
         required_fields = ['nodeName', 'nodeType']
         missing_fields = [field for field in required_fields if field not in data]
-
         if missing_fields:
-            return JsonResponse({
-                'status': 'error',
-                'message': f'缺少必填字段: {", ".join(missing_fields)}'
-            }, status=400)
+            return JsonResponse({'status': 'error', 'message': f'Missing required fields: {", ".join(missing_fields)}'}, status=400)
 
         scene_id = data.get('sceneId')
         scene = None
@@ -1611,10 +1666,7 @@ def add_node_list(request):
             try:
                 scene = Scene.objects.get(id=scene_id)
             except Scene.DoesNotExist:
-                return JsonResponse({
-                    'status': 'error',
-                    'message': f'场景ID {scene_id} 不存在'
-                }, status=404)
+                return JsonResponse({'status': 'error', 'message': f'Scene ID {scene_id} does not exist'}, status=404)
 
         with transaction.atomic():
             node = Node(
@@ -1623,20 +1675,21 @@ def add_node_list(request):
                 nodeImage=data.get('nodeImage'),
                 nodeType=data['nodeType'],
                 details=data.get('details'),
-                specialType = data.get('specialType')
+                specialType=data.get('specialType')
             )
 
             if node.nodeType == 'satellite':
-                required_fields = ['eccentricity', 'argPerigee', 'inclination',
-                                   'meanAnomaly', 'meanMotion', 'raan', 'startTime']
+                required_fields = ['eccentricity', 'argPerigee', 'inclination', 'meanAnomaly', 'meanMotion', 'raan', 'startTime']
                 for field in required_fields:
                     if field not in data:
-                        raise ValidationError(f'缺少卫星节点必填字段: {field}')
-                    setattr(node, field, data[field])
-
+                        raise ValidationError(f'Missing satellite field: {field}')
+                    if field != 'startTime':
+                        setattr(node, field, data[field])
+                node.startTime, _ = _validate_node_timeline(scene, data.get('startTime'), [])
             elif node.nodeType == 'normalNode':
                 if _is_leo_special_type(node.specialType):
                     start_dt, start_point, via_points, orbit_payload = _calculate_leo_points(data)
+                    start_dt, via_points = _validate_node_timeline(scene, start_dt, via_points)
                     node.startTime = start_dt
                     node.lon = start_point.get('lon')
                     node.lat = start_point.get('lat')
@@ -1654,21 +1707,15 @@ def add_node_list(request):
                     required_fields = ['lon', 'lat', 'alt', 'startTime']
                     for field in required_fields:
                         if field not in data:
-                            raise ValidationError(f'缺少普通节点必填字段: {field}')
-                        setattr(node, field, data[field])
-
-                    via_points = data.get('viaPoints')
-                    if via_points:
-                        if not isinstance(via_points, list):
-                            raise ValidationError('viaPoints必须是列表')
-                        for point in via_points:
-                            if not isinstance(point, dict):
-                                raise ValidationError('每个viaPoint必须是字典')
-                            if not all(k in point for k in ['lon', 'lat', 'alt', 'time']):
-                                raise ValidationError('每个viaPoint必须包含 lon、lat、alt 和 time')
+                            raise ValidationError(f'Missing normal node field: {field}')
+                    start_dt, via_points = _validate_node_timeline(scene, data.get('startTime'), data.get('viaPoints'))
+                    node.lon = data.get('lon')
+                    node.lat = data.get('lat')
+                    node.alt = data.get('alt')
+                    node.startTime = start_dt
                     node.viaPoints = via_points
             else:
-                raise ValidationError('无效的节点类型')
+                raise ValidationError('Invalid node type')
 
             node.full_clean()
             node.save()
@@ -1677,62 +1724,13 @@ def add_node_list(request):
                 try:
                     create_default_interface(node)
                 except Exception as e:
-                    raise ValidationError(f'创建默认接口失败: {str(e)}')
+                    raise ValidationError(f'Failed to create default interface: {str(e)}')
 
         return JsonResponse({'status': 'success'})
-
     except ValidationError as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return JsonResponse({'status': 'error', 'message': f'服务器错误: {str(e)}'}, status=500)
-
-
-
-def reorder_interfaces_by_scene(scene_id):
-    """
-    根据场景 ID，重新分配该场景下所有节点的接口序号。
-    sub 接口在前，link 接口在后；sub 内部按子网创建顺序排序。
-    完全避免 UNIQUE constraint 冲突。
-    """
-    try:
-        scene = Scene.objects.get(id=scene_id)
-    except Scene.DoesNotExist:
-        print(f"场景 {scene_id} 不存在")
-        return
-
-    nodes = scene.nodes.all()
-    for node in nodes:
-        interfaces = list(node.interfaces.all())
-        if not interfaces:
-            continue
-
-        # 分组排序
-        sub_ifaces = sorted(
-            [i for i in interfaces if i.interfaceType == Interface.InterfaceTypeChoices.SUB],
-            key=lambda x: (x.subnet.id if x.subnet else 0, x.id)
-        )
-        link_ifaces = sorted(
-            [i for i in interfaces if i.interfaceType == Interface.InterfaceTypeChoices.LINK],
-            key=lambda x: x.id
-        )
-
-        # 使用事务，保证原子操作
-        with transaction.atomic():
-            # 第一步：给每个接口分配一个唯一的临时 index（避免冲突）
-            temp_base = 10000
-            for i, iface in enumerate(sub_ifaces + link_ifaces):
-                Interface.objects.filter(id=iface.id).update(interfaceIndex=temp_base + i)
-
-            # 第二步：按顺序分配最终 index
-            for final_index, iface in enumerate(sub_ifaces + link_ifaces):
-                Interface.objects.filter(id=iface.id).update(interfaceIndex=final_index)
-
-        # print(f"{node.nodeName} 正式分配完序号")
-
-    print(f"场景 {scene.sceneName} 下所有节点接口序号重排完成")
-
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 @require_http_methods(["GET"])
 @csrf_exempt
 def get_node_list(request):
@@ -1880,32 +1878,29 @@ def edit_node_list(request, node_id):
 
     try:
         data = json.loads(request.body)
-
-        # 更新通用字段
         node.nodeName = data.get('nodeName', node.nodeName)
         node.nodeImage = data.get('nodeImage', node.nodeImage)
         node.nodeType = data.get('nodeType', node.nodeType)
-        node.specialType = data.get('specialType',node.specialType)
-        # 验证场景是否存在（如果提供了 sceneId）
+        node.specialType = data.get('specialType', node.specialType)
+
         scene_id = data.get('sceneId')
-        if scene_id is not None:  # 允许 sceneId 为空字符串或显式设置为 None 的情况
+        if scene_id is not None:
             try:
                 scene = Scene.objects.get(id=scene_id)
                 node.sceneId = scene
             except Scene.DoesNotExist:
                 return JsonResponse({'status': 'error', 'message': 'Scene not found'}, status=404)
+        scene = node.sceneId
 
-        # 根据节点类型处理特定字段
         if node.nodeType == 'satellite':
-            # 使用 get 方法获取字段，未提供则保留原值
             node.eccentricity = data.get('eccentricity', node.eccentricity)
             node.argPerigee = data.get('argPerigee', node.argPerigee)
             node.inclination = data.get('inclination', node.inclination)
             node.meanAnomaly = data.get('meanAnomaly', node.meanAnomaly)
             node.meanMotion = data.get('meanMotion', node.meanMotion)
             node.raan = data.get('raan', node.raan)
-            node.startTime = data.get('startTime', node.startTime)
-
+            start_time_value = data.get('startTime', node.startTime.isoformat() if isinstance(node.startTime, datetime) else node.startTime)
+            node.startTime, _ = _validate_node_timeline(scene, start_time_value, [])
         elif node.nodeType == 'normalNode':
             if _is_leo_special_type(node.specialType):
                 calc_payload = {
@@ -1920,6 +1915,7 @@ def edit_node_list(request, node_id):
                     'orbitAltitude': data.get('orbitAltitude', node.orbitAltitude),
                 }
                 start_dt, start_point, via_points, orbit_payload = _calculate_leo_points(calc_payload)
+                start_dt, via_points = _validate_node_timeline(scene, start_dt, via_points)
                 node.startTime = start_dt
                 node.lon = start_point.get('lon')
                 node.lat = start_point.get('lat')
@@ -1934,60 +1930,40 @@ def edit_node_list(request, node_id):
                 node.orbitMeanAnomaly = orbit_payload['orbitMeanAnomaly']
                 node.orbitAltitude = orbit_payload['orbitAltitude']
             else:
-                node.lon = data.get('lon', node.lon)
-                node.lat = data.get('lat', node.lat)
-                node.alt = data.get('alt', node.alt)
-                node.startTime = data.get('startTime', node.startTime)
-
-                # 处理 viaPoints
-                if 'viaPoints' in data:
-                    via_points = data['viaPoints']
-                    try:
-                        if not isinstance(via_points, list):
-                            return JsonResponse({'status': 'error', 'message': 'viaPoints must be a JSON list of points'},
-                                                status=400)
-                        for point in via_points:
-                            if not isinstance(point, dict) or \
-                                    not all(key in point for key in ['lon', 'lat', 'alt', 'time']):
-                                return JsonResponse({'status': 'error',
-                                                     'message': 'Each viaPoint must contain \'lon\', \'lat\', \'alt\', and \'time\''},
-                                                    status=400)
-                        node.viaPoints = via_points
-                    except (TypeError, ValueError):
-                        return JsonResponse({'status': 'error', 'message': 'viaPoints must be valid JSON'}, status=400)
+                lon = data.get('lon', node.lon)
+                lat = data.get('lat', node.lat)
+                alt = data.get('alt', node.alt)
+                start_time_value = data.get('startTime', node.startTime.isoformat() if isinstance(node.startTime, datetime) else node.startTime)
+                via_points_value = data['viaPoints'] if 'viaPoints' in data else node.viaPoints
+                start_dt, via_points = _validate_node_timeline(scene, start_time_value, via_points_value)
+                node.lon = lon
+                node.lat = lat
+                node.alt = alt
+                node.startTime = start_dt
+                node.viaPoints = via_points
         else:
             return JsonResponse({'status': 'error', 'message': 'Invalid node type'}, status=400)
 
-        # 处理 details 字段,#还没有处理接口ip。
         if 'details' in data:
             details = data['details']
-            # 检查是否为列表
-            if not isinstance(details, list):  # 条件成立（字符串不是列表）
-                return JsonResponse({'status': 'error', 'message': 'details must be a list'}, status=400)
-            interfaces = list(node.interfaces.all().order_by('interfaceIndex'))
-
             if not isinstance(details, list):
                 return JsonResponse({'status': 'error', 'message': 'details must be a list'}, status=400)
-
+            interfaces = list(node.interfaces.all().order_by('interfaceIndex'))
             if len(details) != len(interfaces):
-                return JsonResponse({
-                    'status': 'error',
-                    'message': f'Details count ({len(details)}) does not match interface count ({len(interfaces)})'
-                }, status=400)
-
-            # 更新每个接口的 detail 字段
+                return JsonResponse({'status': 'error', 'message': f'details count ({len(details)}) does not match interface count ({len(interfaces)})'}, status=400)
             for i, interface in enumerate(interfaces):
                 interface.detail = details[i]
                 interface.save(update_fields=['detail'])
+            node.details = details
+
         node.save()
         return JsonResponse({'status': 'success'})
-
     except json.JSONDecodeError:
         return JsonResponse({'status': 'error', 'message': 'Invalid JSON format'}, status=400)
+    except ValidationError as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
     except Exception as e:
         return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
-
-
 @require_http_methods(["DELETE"])
 @csrf_exempt
 def delete_node_list(request, node_id):
@@ -2124,71 +2100,128 @@ def edit_configuration_list(request, configuration_id):
     data = json.loads(request.body)
 
     # 更新通用字段
-    config.businessName = data.get('businessName', config.businessName)
+    if 'businessName' in data:
+        config.businessName = data.get('businessName', config.businessName)
 
-    source_node_id = data.get('sourceNodeId')
-    if source_node_id:
-        config.sourceNodeId = Node.objects.get(id=source_node_id)
+    if 'sourceNodeId' in data:
+        source_node_id = data.get('sourceNodeId')
+        config.sourceNodeId = Node.objects.get(id=source_node_id) if source_node_id else None
 
-    destination_node_id = data.get('destinationNodeId')
-    if destination_node_id:
-        config.destinationNodeId = Node.objects.get(id=destination_node_id)
+    if 'destinationNodeId' in data:
+        destination_node_id = data.get('destinationNodeId')
+        config.destinationNodeId = Node.objects.get(id=destination_node_id) if destination_node_id else None
 
     # 不允许修改 businessType，只使用原有值判断更新内容
     business_type = normalize_business_type(config.businessType)
 
     if business_type == 'CBR':
-        config.cbrStartTime = data.get('cbrStartTime', config.cbrStartTime)
-        config.cbrEndTime = data.get('cbrEndTime', config.cbrEndTime)
-        config.cbrSendInterval = data.get('cbrSendInterval', config.cbrSendInterval)
-        config.cbrPacketSize = data.get('cbrPacketSize', config.cbrPacketSize)
-        config.cbrPrecedence = data.get('cbrPrecedence', config.cbrPrecedence)
-        config.TransferType = data.get('TransferType', config.TransferType)
+        if 'cbrStartTime' in data:
+            config.cbrStartTime = data.get('cbrStartTime')
+        if 'cbrEndTime' in data:
+            config.cbrEndTime = data.get('cbrEndTime')
+        if 'cbrSendInterval' in data:
+            config.cbrSendInterval = data.get('cbrSendInterval')
+        if 'cbrPacketSize' in data:
+            config.cbrPacketSize = data.get('cbrPacketSize')
+        if 'cbrPrecedence' in data:
+            config.cbrPrecedence = data.get('cbrPrecedence')
+        if 'TransferType' in data:
+            config.TransferType = data.get('TransferType')
     elif business_type == 'FTP':
-        config.ftpStartTime = data.get('ftpStartTime', config.ftpStartTime)
-        config.ftpPacketCount = data.get('ftpPacketCount', config.ftpPacketCount)
+        if 'ftpStartTime' in data:
+            config.ftpStartTime = data.get('ftpStartTime')
+        if 'ftpPacketCount' in data:
+            config.ftpPacketCount = data.get('ftpPacketCount')
 
     elif business_type == 'TRAFFIC-GEN':
-        config.tgStartTime = data.get('tgStartTime', config.tgStartTime)
-        config.tgDurationTime = data.get('tgDurationTime', config.tgDurationTime)
-        config.tgPacketSize = data.get('tgPacketSize', config.tgPacketSize)
-        config.tgSendInterval = data.get('tgSendInterval', config.tgSendInterval)
+        if 'tgStartTime' in data:
+            config.tgStartTime = data.get('tgStartTime')
+        if 'tgDurationTime' in data:
+            config.tgDurationTime = data.get('tgDurationTime')
+        if 'tgPacketSize' in data:
+            config.tgPacketSize = data.get('tgPacketSize')
+        if 'tgSendInterval' in data:
+            config.tgSendInterval = data.get('tgSendInterval')
 
     elif business_type == 'HTTP':
-        client_id = data.get('clientId')
-        if client_id:
-            config.clientId = Node.objects.get(id=client_id)
-
-        server_list = data.get('serverList')
-        if server_list is not None:
-            config.serverList = server_list
-
-        config.httpStartTime = data.get('httpStartTime', config.httpStartTime)
-        config.httpThreshTime = data.get('httpThreshTime', config.httpThreshTime)
+        if 'clientId' in data:
+            client_id = data.get('clientId')
+            config.clientId = Node.objects.get(id=client_id) if client_id else None
+        if 'serverList' in data:
+            config.serverList = data.get('serverList')
+        if 'httpStartTime' in data:
+            config.httpStartTime = data.get('httpStartTime')
+        if 'httpThreshTime' in data:
+            config.httpThreshTime = data.get('httpThreshTime')
 
     elif business_type == 'POISSON':
-        config.poissonStartTime = data.get('poissonStartTime', config.poissonStartTime)
-        config.poissonEndTime = data.get('poissonEndTime', config.poissonEndTime)
-        config.poissonMeanInterval = data.get('poissonMeanInterval', config.poissonMeanInterval)
-        config.poissonPacketSize = data.get('poissonPacketSize', config.poissonPacketSize)
+        if 'poissonStartTime' in data:
+            config.poissonStartTime = data.get('poissonStartTime')
+        if 'poissonEndTime' in data:
+            config.poissonEndTime = data.get('poissonEndTime')
+        if 'poissonMeanInterval' in data:
+            config.poissonMeanInterval = data.get('poissonMeanInterval')
+        if 'poissonPacketSize' in data:
+            config.poissonPacketSize = data.get('poissonPacketSize')
 
     elif business_type == 'BROADCAST':
-        config.broadcastDest = data.get('broadcastDest', config.broadcastDest)
-        config.broadcastTransportType = data.get('broadcastTransportType', config.broadcastTransportType)
-        config.broadcastAppType = data.get('broadcastAppType', config.broadcastAppType)
-        config.broadcastLifeTime = data.get('broadcastLifeTime', config.broadcastLifeTime)
-        config.broadcastStartTime = data.get('broadcastStartTime', config.broadcastStartTime)
-        config.broadcastInterval = data.get('broadcastInterval', config.broadcastInterval)
-        config.broadcastFragmentSize = data.get('broadcastFragmentSize', config.broadcastFragmentSize)
-        config.broadcastFragmentNum = data.get('broadcastFragmentNum', config.broadcastFragmentNum)
+        if 'broadcastDest' in data:
+            config.broadcastDest = data.get('broadcastDest')
+        if 'broadcastTransportType' in data:
+            config.broadcastTransportType = data.get('broadcastTransportType')
+        if 'broadcastAppType' in data:
+            config.broadcastAppType = data.get('broadcastAppType')
+        if 'broadcastLifeTime' in data:
+            config.broadcastLifeTime = data.get('broadcastLifeTime')
+        if 'broadcastStartTime' in data:
+            config.broadcastStartTime = data.get('broadcastStartTime')
+        if 'broadcastInterval' in data:
+            config.broadcastInterval = data.get('broadcastInterval')
+        if 'broadcastFragmentSize' in data:
+            config.broadcastFragmentSize = data.get('broadcastFragmentSize')
+        if 'broadcastFragmentNum' in data:
+            config.broadcastFragmentNum = data.get('broadcastFragmentNum')
 
     elif business_type == 'MULTICAST':
-        config.multicastDestination = data.get('multicastDestination', config.multicastDestination)
-        config.multicastItemsToSend = data.get('multicastItemsToSend', config.multicastItemsToSend)
-        config.multicastItemSize = data.get('multicastItemSize', config.multicastItemSize)
-        config.multicastInterval = data.get('multicastInterval', config.multicastInterval)
-        config.multicastStartTime = data.get('multicastStartTime', config.multicastStartTime)
-        config.multicastEndTime = data.get('multicastEndTime', config.multicastEndTime)
+        if 'multicastDestination' in data:
+            config.multicastDestination = data.get('multicastDestination')
+        if 'multicastItemsToSend' in data:
+            config.multicastItemsToSend = data.get('multicastItemsToSend')
+        if 'multicastItemSize' in data:
+            config.multicastItemSize = data.get('multicastItemSize')
+        if 'multicastInterval' in data:
+            config.multicastInterval = data.get('multicastInterval')
+        if 'multicastStartTime' in data:
+            config.multicastStartTime = data.get('multicastStartTime')
+        if 'multicastEndTime' in data:
+            config.multicastEndTime = data.get('multicastEndTime')
+
+    if business_type == 'CBR':
+        _validate_scene_time_window(
+            config.sceneId,
+            _parse_datetime_input(config.cbrStartTime, 'cbrStartTime'),
+            _parse_datetime_input(config.cbrEndTime, 'cbrEndTime'),
+            'cbrStartTime',
+            'cbrEndTime',
+        )
+    elif business_type == 'FTP' and config.ftpStartTime:
+        _validate_scene_datetime_bounds(
+            config.sceneId,
+            _parse_datetime_input(config.ftpStartTime, 'ftpStartTime'),
+            'ftpStartTime',
+        )
+    elif business_type == 'TRAFFIC-GEN' and config.tgStartTime:
+        _validate_scene_datetime_bounds(
+            config.sceneId,
+            _parse_datetime_input(config.tgStartTime, 'tgStartTime'),
+            'tgStartTime',
+        )
+    elif business_type == 'HTTP' and config.httpStartTime:
+        _validate_scene_datetime_bounds(
+            config.sceneId,
+            _parse_datetime_input(config.httpStartTime, 'httpStartTime'),
+            'httpStartTime',
+        )
 
     config.save()
 
@@ -2852,51 +2885,38 @@ def delete_link_list(request, link_id):
 
 @require_http_methods(["POST"])
 def add_node_error_list(request):
-    # 解析 JSON 数据
     data = json.loads(request.body)
-
-    # 获取表单字段
     scene_id = data.get('sceneId')
     node_id = data.get('nodeId')
     error_start_time = data.get('errorStartTime')
     error_end_time = data.get('errorEndTime')
-    interface_index = data.get('interfaceIndex')  # 可选接口序号
+    interface_index = data.get('interfaceIndex')
 
-    # 查询 Scene 实例
     try:
         scene = Scene.objects.get(id=scene_id)
     except Scene.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '场景不存在'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Scene not found'}, status=404)
 
-    # 查询 Node 实例
     try:
         node = Node.objects.get(id=node_id)
     except Node.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '节点不存在'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Node not found'}, status=404)
 
-    # 根据接口序号查找接口（可选）
+    if node.sceneId_id != scene.id:
+        return JsonResponse({'status': 'error', 'message': 'nodeId does not belong to the selected scene'}, status=400)
+
     interface = None
     if interface_index is not None:
         try:
             interface = Interface.objects.get(node_id=node_id, interfaceIndex=interface_index)
         except Interface.DoesNotExist:
-            return JsonResponse({'status': 'error', 'message': f'节点下不存在接口序号 {interface_index}'}, status=404)
+            return JsonResponse({'status': 'error', 'message': f'Interface index {interface_index} does not exist on the node'}, status=404)
 
-        # 将字符串转换为 datetime 对象
-    if error_start_time:
-        try:
-            error_start_time = datetime.fromisoformat(error_start_time)
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的开始时间格式'}, status=400)
-    if error_end_time:
-        try:
-            error_end_time = datetime.fromisoformat(error_end_time)
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的结束时间格式'}, status=400)
-            # 验证开始时间是否早于结束时间
-    if error_start_time and error_end_time and error_start_time >= error_end_time:
-        return JsonResponse({'status': 'error', 'message': '开始时间必须早于结束时间'}, status=400)
-    # 创建表单实例
+    try:
+        error_start_time, error_end_time = _parse_error_window(scene, error_start_time, error_end_time)
+    except ValidationError as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
     form = ErrorForm({
         'sceneId': scene_id,
         'nodeId': node_id,
@@ -2908,9 +2928,7 @@ def add_node_error_list(request):
     if form.is_valid():
         form.save()
         return JsonResponse({'status': 'success'})
-    else:
-        return JsonResponse({'status': 'error', 'errors': form.errors}, status=400)
-
+    return JsonResponse({'status': 'error', 'errors': form.errors}, status=400)
 
 #
 @require_http_methods(["DELETE"])
@@ -2990,22 +3008,16 @@ def get_node_error_list(request):
 
 @require_http_methods(["GET"])
 def get_channel_names(request):
-    """
-    获取指定场景下所有信道名称
-    参数: sceneId
-    返回: channelNames 列表
-    """
     scene_id = request.GET.get('sceneId')
     if not scene_id:
-        return JsonResponse({'status': 'error', 'message': '缺少 sceneId 参数'}, status=400)
+        return JsonResponse({'status': 'error', 'message': 'Missing sceneId'}, status=400)
 
     try:
         scene = Scene.objects.get(id=scene_id)
     except Scene.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '场景不存在'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Scene not found'}, status=404)
 
     _, channel_names, _ = _get_scene_channel_data(scene)
-
     return JsonResponse({
         'status': 'success',
         'channelNames': channel_names,
@@ -3016,40 +3028,30 @@ def get_channel_names(request):
 @require_http_methods(["POST"])
 @csrf_exempt
 def add_link_error_list(request):
-    # 解析 JSON 数据
     data = json.loads(request.body)
-
-    # 获取表单字段
     scene_id = data.get('sceneId')
     link_id = data.get('linkId')
     error_start_time = data.get('errorStartTime')
     error_end_time = data.get('errorEndTime')
 
-    # 查询 Scene 实例
     try:
         scene = Scene.objects.get(id=scene_id)
     except Scene.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '场景不存在'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Scene not found'}, status=404)
 
-    # 查询 Link 实例
     try:
         link = Link.objects.get(id=link_id)
     except Link.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '链路不存在'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Link not found'}, status=404)
 
-    # 将字符串转换为 datetime 对象
-    if error_start_time:
-        try:
-            error_start_time = datetime.fromisoformat(error_start_time)
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的开始时间格式'}, status=400)
-    if error_end_time:
-        try:
-            error_end_time = datetime.fromisoformat(error_end_time)
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的结束时间格式'}, status=400)
+    if link.sceneId_id != scene.id:
+        return JsonResponse({'status': 'error', 'message': 'linkId does not belong to the selected scene'}, status=400)
 
-    # 创建表单实例
+    try:
+        error_start_time, error_end_time = _parse_error_window(scene, error_start_time, error_end_time)
+    except ValidationError as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
+
     form = LinkErrorForm({
         'sceneId': scene.id,
         'linkId': link.id,
@@ -3060,69 +3062,51 @@ def add_link_error_list(request):
     if form.is_valid():
         form.save()
         return JsonResponse({'status': 'success'})
-    else:
-        return JsonResponse({'status': 'error', 'errors': form.errors}, status=400)
+    return JsonResponse({'status': 'error', 'errors': form.errors}, status=400)
 
 
 @require_http_methods(["GET"])
 def get_link_error_list(request):
     try:
-        # 获取查询参数
         page_size = int(request.GET.get('size', 10))
         page_number = int(request.GET.get('page', 1))
         link_name = request.GET.get('linkName', '')
         source_node_name = request.GET.get('sourceNodeName', '')
         destination_node_name = request.GET.get('destinationNodeName', '')
-        scene_id = request.GET.get('sceneId', '')  # 新增场景ID查询参数
+        scene_id = request.GET.get('sceneId', '')
 
-        # 构建查询条件
         query = Q()
-
-        # 1. 添加场景ID过滤
         if scene_id:
             try:
-                # 验证场景ID是否存在
                 scene = Scene.objects.get(id=scene_id)
                 query &= Q(sceneId=scene)
             except Scene.DoesNotExist:
-                return JsonResponse({
-                    'status': 'error',
-                    'message': f'场景ID {scene_id} 不存在'
-                }, status=400)
-
-        # 2. 添加链路名称过滤
+                return JsonResponse({'status': 'error', 'message': f'Scene ID {scene_id} does not exist'}, status=400)
         if link_name:
             query &= Q(linkId__linkName__icontains=link_name)
-
-        # 3. 添加源节点名称过滤
         if source_node_name:
             query &= Q(linkId__sourceNodeId__nodeName__icontains=source_node_name)
-
-        # 4. 添加目标节点名称过滤
         if destination_node_name:
             query &= Q(linkId__destinationNodeId__nodeName__icontains=destination_node_name)
 
-        # 获取查询结果并分页
         link_errors = LinkError.objects.filter(query).select_related(
             'linkId__sourceNodeId',
             'linkId__destinationNodeId',
-            'sceneId'  # 新增场景关联
-        ).order_by('-errorStartTime')  # 按错误开始时间倒序排序
+            'sceneId'
+        ).order_by('-errorStartTime')
 
         paginator = Paginator(link_errors, page_size)
         page_obj = paginator.get_page(page_number)
-
-        # 准备要返回的数据
         link_error_list = [
             {
                 'id': error.id,
                 'sceneId': error.sceneId.id,
-                'sceneName': error.sceneId.sceneName,  # 新增场景名称
-                'linkId': error.linkId.id,  # 新增链路ID
+                'sceneName': error.sceneId.sceneName,
+                'linkId': error.linkId.id,
                 'linkName': error.linkId.linkName,
-                'sourceNodeId': error.linkId.sourceNodeId.id,  # 新增源节点ID
+                'sourceNodeId': error.linkId.sourceNodeId.id,
                 'sourceNodeName': error.linkId.sourceNodeId.nodeName,
-                'destinationNodeId': error.linkId.destinationNodeId.id,  # 新增目标节点ID
+                'destinationNodeId': error.linkId.destinationNodeId.id,
                 'destinationNodeName': error.linkId.destinationNodeId.nodeName,
                 'errorStartTime': error.errorStartTime.isoformat() if error.errorStartTime else None,
                 'errorEndTime': error.errorEndTime.isoformat() if error.errorEndTime else None,
@@ -3141,170 +3125,126 @@ def get_link_error_list(request):
                 'total_count': paginator.count,
             }
         })
-
     except ValueError as e:
-        return JsonResponse({
-            'status': 'error',
-            'message': f'参数错误: {str(e)}'
-        }, status=400)
+        return JsonResponse({'status': 'error', 'message': f'Parameter error: {str(e)}'}, status=400)
     except Exception as e:
-        return JsonResponse({
-            'status': 'error',
-            'message': f'服务器错误: {str(e)}'
-        }, status=500)
+        return JsonResponse({'status': 'error', 'message': f'Server error: {str(e)}'}, status=500)
 
 
 @require_http_methods(["DELETE"])
 def delete_link_error_list(request, link_error_id):
     try:
-        # 尝试获取链路故障实例
         link_error = LinkError.objects.get(id=link_error_id)
-        # 删除链路故障实例
         link_error.delete()
         return JsonResponse({'status': 'success'})
     except LinkError.DoesNotExist:
-        # 如果链路故障不存在，返回404错误
-        return JsonResponse({'status': 'error', 'message': '链路故障不存在'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Link error not found'}, status=404)
     except Exception as e:
-        # 其他错误，返回500错误
         return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
 
 
 @csrf_exempt
 @require_http_methods(["PUT"])
 def edit_link_error_list(request, link_error_id):
-    # 解析 JSON 数据
     data = json.loads(request.body)
-    # 获取表单字段
-    error_id = link_error_id
     link_id = data.get('linkId')
     error_start_time = data.get('errorStartTime')
     error_end_time = data.get('errorEndTime')
 
-    # 查询 LinkError 实例
     try:
-        link_error = LinkError.objects.get(id=error_id)
+        link_error = LinkError.objects.get(id=link_error_id)
     except LinkError.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '故障记录不存在'}, status=404)
+        return JsonResponse({'status': 'error', 'message': 'Link error not found'}, status=404)
 
-    # 更新字段
+    scene = link_error.sceneId
     if link_id:
         try:
             link = Link.objects.get(id=link_id)
-            link_error.linkId = link
         except Link.DoesNotExist:
-            return JsonResponse({'status': 'error', 'message': '链路不存在'}, status=404)
+            return JsonResponse({'status': 'error', 'message': 'Link not found'}, status=404)
+        if link.sceneId_id != scene.id:
+            return JsonResponse({'status': 'error', 'message': 'linkId does not belong to this scene'}, status=400)
+        link_error.linkId = link
 
-    if error_start_time:
-        try:
-            error_start_time = datetime.fromisoformat(error_start_time)
-            link_error.errorStartTime = error_start_time
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的开始时间格式'}, status=400)
+    start_value = error_start_time if error_start_time is not None else link_error.errorStartTime
+    end_value = error_end_time if error_end_time is not None else link_error.errorEndTime
+    try:
+        parsed_start_time, parsed_end_time = _parse_error_window(scene, start_value, end_value)
+    except ValidationError as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
-    if error_end_time:
-        try:
-            error_end_time = datetime.fromisoformat(error_end_time)
-            link_error.errorEndTime = error_end_time
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的结束时间格式'}, status=400)
-
-    # 保存更新
+    link_error.errorStartTime = parsed_start_time
+    link_error.errorEndTime = parsed_end_time
     link_error.save()
-
     return JsonResponse({'status': 'success'})
 
 
 @csrf_exempt
 @require_http_methods(["PUT"])
 def edit_node_error_list(request, node_error_id):
-    # 解析 JSON 数据
     data = json.loads(request.body)
-    # 获取表单字段
-    error_id = node_error_id
     node_id = data.get('nodeId')
     error_start_time = data.get('errorStartTime')
     error_end_time = data.get('errorEndTime')
-    interface_index = data.get('interfaceIndex')  # 可选接口序号
+    interface_index = data.get('interfaceIndex')
 
-    # 查询 NodeError 实例
     try:
-        node_error = Error.objects.get(id=error_id)
+        node_error = Error.objects.get(id=node_error_id)
     except Error.DoesNotExist:
-        return JsonResponse({'status': 'error', 'message': '故障记录不存在'}, status=404)
-    # 更新字段
+        return JsonResponse({'status': 'error', 'message': 'Node error not found'}, status=404)
+
+    scene = node_error.sceneId
     if node_id:
         try:
             node = Node.objects.get(id=node_id)
-            node_error.nodeId = node
         except Node.DoesNotExist:
-            return JsonResponse({'status': 'error', 'message': '节点不存在'}, status=404)
+            return JsonResponse({'status': 'error', 'message': 'Node not found'}, status=404)
+        if node.sceneId_id != scene.id:
+            return JsonResponse({'status': 'error', 'message': 'nodeId does not belong to this scene'}, status=400)
+        node_error.nodeId = node
 
-    # 更新接口（可选）
     if 'interfaceIndex' in data:
         if interface_index is not None:
-            target_node_id = node_id if node_id else node_error.nodeId_id
             try:
-                interface = Interface.objects.get(node_id=target_node_id, interfaceIndex=interface_index)
-                node_error.interfaceId = interface
+                interface = Interface.objects.get(node_id=node_error.nodeId_id, interfaceIndex=interface_index)
             except Interface.DoesNotExist:
-                return JsonResponse({'status': 'error', 'message': f'节点下不存在接口序号 {interface_index}'}, status=404)
+                return JsonResponse({'status': 'error', 'message': f'Interface index {interface_index} does not exist on the node'}, status=404)
+            node_error.interfaceId = interface
         else:
-            # 如果传入 null，则设为 None（整个节点故障）
             node_error.interfaceId = None
 
-    if error_start_time:
-        try:
-            error_start_time = datetime.fromisoformat(error_start_time)
-            node_error.errorStartTime = error_start_time
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的开始时间格式'}, status=400)
+    start_value = error_start_time if error_start_time is not None else node_error.errorStartTime
+    end_value = error_end_time if error_end_time is not None else node_error.errorEndTime
+    try:
+        parsed_start_time, parsed_end_time = _parse_error_window(scene, start_value, end_value)
+    except ValidationError as e:
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 
-    if error_end_time:
-        try:
-            error_end_time = datetime.fromisoformat(error_end_time)
-            node_error.errorEndTime = error_end_time
-        except ValueError:
-            return JsonResponse({'status': 'error', 'message': '无效的结束时间格式'}, status=400)
-
-    # 保存更新
+    node_error.errorStartTime = parsed_start_time
+    node_error.errorEndTime = parsed_end_time
     node_error.save()
-
     return JsonResponse({'status': 'success'})
 
 
-'''
-节点模板表
-'''
-
-
+@csrf_exempt
 @require_http_methods(["POST"])
 def add_node_template_list(request):
     try:
         data = json.loads(request.body)
-        template_name = data.get("templateName")
-        template_type = data.get("templateType")
-        template_info = data.get("templateInfo")
+        template_name = data.get('templateName')
+        template_type = data.get('templateType')
+        template_info = data.get('templateInfo')
 
         if not template_name or not template_type or not template_info:
-            return JsonResponse({"status": "error", "message": "缺少必要字段"}, status=400)
-
-        # 检查 templateName 是否已存在
+            return JsonResponse({'status': 'error', 'message': 'Missing required fields'}, status=400)
         if NodeTemplate.objects.filter(templateName=template_name).exists():
-            return JsonResponse({"status": "error", "message": "模板名称已存在"}, status=400)
+            return JsonResponse({'status': 'error', 'message': 'Template name already exists'}, status=400)
 
-        new_template = NodeTemplate(
-            templateName=template_name,
-            templateType=template_type,
-            templateInfo=template_info
-        )
+        new_template = NodeTemplate(templateName=template_name, templateType=template_type, templateInfo=template_info)
         new_template.save()
-
-        return JsonResponse({"status": "success", "message": "模板添加成功"})
+        return JsonResponse({'status': 'success', 'message': 'Template added successfully'})
     except Exception as e:
-        return JsonResponse({"status": "error", "message": str(e)}, status=400)
-
-
+        return JsonResponse({'status': 'error', 'message': str(e)}, status=400)
 @require_http_methods(["GET"])
 def get_node_template_list(request):
     template_type = request.GET.get('templateType', '')
@@ -5221,6 +5161,7 @@ def _get_scene_files_root():
     if getattr(settings, 'MEDIA_ROOT', ''):
         return Path(settings.MEDIA_ROOT) / 'scene_files'
     return Path(settings.BASE_DIR) / 'scene_files'
+
 
 def _resolve_scene_runtime_context(scene_id):
     try:
