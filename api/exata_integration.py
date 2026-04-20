@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from statistics import mean
 from typing import Any
 
 from django.conf import settings
@@ -17,7 +19,12 @@ from exata_stat_analyzer import (
     export_cbr_classification_txt,
     export_layer_metrics_txt,
 )
+from exata_stat_analyzer.models import FileAccessError, ParseError
 from exata_stat_analyzer.models import MetricSelector
+from exata_stat_analyzer.index import RecordIndex
+from exata_stat_analyzer.metrics import build_metric_results
+from exata_stat_analyzer.parser import parse_stat_file
+from exata_stat_analyzer.scenario import load_scenario_context
 
 from .models import Scene
 
@@ -36,6 +43,190 @@ LAYER_REPORT_METRICS = [
     "link_utilization",
     "routing_convergence_time",
 ]
+
+
+def _wants_json_response(payload: dict[str, Any]) -> bool:
+    return str(payload.get("responseFormat") or "").strip().lower() == "json"
+
+
+def _build_structured_summary_request(request: AnalysisRequest) -> AnalysisRequest:
+    return AnalysisRequest(
+        metrics=list(LAYER_REPORT_METRICS),
+        selector=request.selector,
+        rate_basis=request.rate_basis,
+        loss_basis=request.loss_basis,
+        config_path=request.config_path,
+        app_path=request.app_path,
+    )
+
+
+def _numeric_values(records: list[Any], predicate) -> list[float]:
+    values: list[float] = []
+    for record in records:
+        if not predicate(record):
+            continue
+        if isinstance(record.value, (int, float)):
+            values.append(float(record.value))
+    return values
+
+
+def _mean_or_none(values: list[float]) -> float | None:
+    if not values:
+        return None
+    return float(mean(values))
+
+
+def _row_basis(parts: list[tuple[str, list[Any]]]) -> str:
+    labels = [f"{label}: {records[0].metric_name}" for label, records in parts if records]
+    return " | ".join(labels)
+
+
+def _build_layer_groups(records: list[Any], request: AnalysisRequest) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[Any]] = defaultdict(list)
+    for record in records:
+        selector = request.selector
+        if selector.layer and record.layer.lower() != selector.layer.lower():
+            continue
+        if selector.protocol and record.module.lower() != selector.protocol.lower():
+            continue
+        if selector.traffic_class and selector.traffic_class.lower() not in record.metric_key:
+            continue
+        grouped[(record.layer, record.module)].append(record)
+
+    rows: list[dict[str, Any]] = []
+    for (layer, module), group_records in sorted(grouped.items(), key=lambda item: (item[0][0].lower(), item[0][1].lower())):
+        if not str(layer).strip() and not str(module).strip():
+            continue
+        layer_lower = layer.lower()
+        if layer_lower == "application":
+            throughput_records = [record for record in group_records if "received throughput" in record.metric_key]
+            offered_records = [record for record in group_records if "offered load" in record.metric_key]
+        elif layer_lower == "transport":
+            throughput_records = [record for record in group_records if "throughput at the transport layer" in record.metric_key]
+            offered_records = [record for record in group_records if "offered load" in record.metric_key]
+        elif layer_lower == "network":
+            throughput_records = [
+                record
+                for record in group_records
+                if "carried load" in record.metric_key and "originated" not in record.metric_key and "forwarded" not in record.metric_key
+            ]
+            offered_records = [record for record in group_records if "offered load" in record.metric_key]
+        else:
+            throughput_records = [record for record in group_records if "throughput" in record.metric_key]
+            offered_records = [record for record in group_records if "offered load" in record.metric_key]
+
+        delay_records = [
+            record
+            for record in group_records
+            if "delay" in record.metric_key and "delivery delay" not in record.metric_key and isinstance(record.value, (int, float))
+        ]
+        jitter_records = [
+            record
+            for record in group_records
+            if "jitter" in record.metric_key and "delivery jitter" not in record.metric_key and isinstance(record.value, (int, float))
+        ]
+        utilization_records = [
+            record
+            for record in group_records
+            if ("utilization (percent/100)" in record.metric_key or "link utilization" in record.metric_key)
+            and isinstance(record.value, (int, float))
+        ]
+
+        rows.append(
+            {
+                "layer": layer,
+                "module": module,
+                "record_count": len(group_records),
+                "throughput_bps": _mean_or_none(_numeric_values(throughput_records, lambda record: True)),
+                "delay_s": _mean_or_none(_numeric_values(delay_records, lambda record: True)),
+                "jitter_s": _mean_or_none(_numeric_values(jitter_records, lambda record: True)),
+                "offered_load_bps": _mean_or_none(_numeric_values(offered_records, lambda record: True)),
+                "link_utilization_ratio": _mean_or_none(_numeric_values(utilization_records, lambda record: True)),
+                "basis": _row_basis(
+                    [
+                        ("throughput", throughput_records),
+                        ("delay", delay_records),
+                        ("jitter", jitter_records),
+                        ("offered_load", offered_records),
+                        ("link_utilization", utilization_records),
+                    ]
+                ),
+            }
+        )
+
+    return rows
+
+
+def _to_session_row(row: dict[str, Any]) -> dict[str, Any]:
+    mapping_status = str(row.get("mapping_status") or "")
+    pairing_status = "partial" if mapping_status == "partial" else "paired"
+    return {
+        "session_id": row.get("business_id"),
+        "module_family": "UDP",
+        "client_node_id": row.get("client_node_id"),
+        "client_peer_ip": row.get("client_ip"),
+        "server_node_id": row.get("server_node_id"),
+        "server_peer_ip": row.get("server_ip"),
+        "client_entity_id": row.get("client_node_id"),
+        "server_entity_id": row.get("server_node_id"),
+        "start_s": row.get("start_s"),
+        "finish_s": row.get("end_s"),
+        "status": mapping_status or "unknown",
+        "messages_sent": row.get("messages_sent"),
+        "messages_received": row.get("messages_received"),
+        "throughput_bps": row.get("throughput_bps"),
+        "delay_s": row.get("mean_delay_s"),
+        "jitter_s": row.get("mean_jitter_s"),
+        "pairing_status": pairing_status,
+    }
+
+
+def _build_structured_payload(
+    stat_path: Path,
+    config_path: Path | None,
+    app_path: Path | None,
+    request: AnalysisRequest,
+) -> dict[str, Any]:
+    records = parse_stat_file(stat_path)
+    record_index = RecordIndex(records)
+    warnings: list[str] = []
+    scenario_context = None
+    if config_path is not None:
+        try:
+            scenario_context = load_scenario_context(config_path, app_path=app_path)
+        except (FileAccessError, ParseError, ValueError) as exc:
+            warnings.append(f"Scenario context unavailable: {exc}")
+
+    summary_request = _build_structured_summary_request(request)
+    summary_metrics, summary_warnings = build_metric_results(record_index, summary_request, scenario_context=scenario_context)
+    warnings.extend(summary_warnings)
+
+    application_sessions: list[dict[str, Any]] = []
+    if scenario_context is not None:
+        session_request = AnalysisRequest(
+            metrics=["cbr_sessions"],
+            selector=request.selector,
+            rate_basis=request.rate_basis,
+            loss_basis=request.loss_basis,
+            config_path=request.config_path,
+            app_path=request.app_path,
+        )
+        session_metrics, _ = build_metric_results(record_index, session_request, scenario_context=scenario_context)
+        cbr_metric = session_metrics.get("cbr_sessions")
+        if cbr_metric and cbr_metric.available and isinstance(cbr_metric.value, list):
+            application_sessions = [_to_session_row(row) for row in cbr_metric.value]
+
+    return {
+        "source": {
+            "file": str(stat_path),
+            "stat_file": stat_path.name,
+            "parsed_records": len(records),
+        },
+        "summary_metrics": {name: metric.to_dict() for name, metric in summary_metrics.items()},
+        "application_sessions": application_sessions,
+        "layer_groups": _build_layer_groups(records, request),
+        "warnings": warnings,
+    }
 
 
 def _project_root() -> Path:
@@ -379,6 +570,14 @@ def analyze_exata_stat(request):
     try:
         scene_name, scene_id, scene_folder, stat_path, config_path, app_path = _resolve_analysis_files(payload)
         analysis_request = _build_request(payload, config_path, app_path)
+        if _wants_json_response(payload):
+            structured_payload = _build_structured_payload(
+                stat_path=stat_path,
+                config_path=config_path,
+                app_path=app_path,
+                request=analysis_request,
+            )
+            return JsonResponse(structured_payload, json_dumps_params={"ensure_ascii": False})
 
         if "cbr_sessions" in analysis_request.metrics and config_path is None:
             return HttpResponse("cbr_sessions 需要提供 .config 文件", status=400, content_type="text/plain; charset=utf-8")

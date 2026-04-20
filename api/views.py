@@ -15,6 +15,7 @@ import time
 import threading
 import binascii
 import math
+from collections import deque
 
 from django.views import View
 from django.middleware.csrf import get_token
@@ -63,6 +64,16 @@ import glob
 from typing import List, Dict, Tuple
 from django.conf import settings
 from jinja2 import Environment, FileSystemLoader
+from .interface_manager import reorder_interfaces_by_scene
+from .exata_socket_interface import (
+    ExataMessageType,
+    ExataProtocolCodec,
+    ExataRuntimePhase,
+    ExataSimulationState,
+    ExataRuntimeStateMachine,
+    decode_exata_message,
+    parse_exata_stream,
+)
 
 
 def env_flag(name, default=False):
@@ -6105,21 +6116,29 @@ class SocketView(View):
 
     config_file = absolute_path / 'config.txt'
     initial_file = absolute_path / 'initial.txt'
-    exata_response = ""  # 存储从 Exata 接收的响应
+    exata_response = b""  # 存储从 Exata 接收的响应
     handleMessage_queue = []  # 存储处理的消息
     data = ""  # 存储发送的消息的头部和内容
     timeToSend = 5
-    send_queue = []  # 存储所有需要发送的消息
-    receive_queue = []  # 存储接受到的信息
+    send_queue = deque()  # 存储所有需要发送的消息
+    receive_queue = deque()  # 存储接受到的信息
+    send_queue_lock = Lock()
+    receive_queue_lock = Lock()
+    send_lock = Lock()
+    state_event = threading.Event()
+    receive_buffer = b""
+    runtime_state = ExataRuntimeStateMachine()
     simulation_running = False  # 用于判断仿真是否正在运行
     message_indexStep = 0  # 当前发送的消息索引
     message_indexContinue = 0  # 当前发送的消息索引
-    initialmessage = "01 01 00 00 00 00 00 12 00 00 00 00 CD 00 00 00 09 01"
-    pausemessage = "02 00 00 00 00 00 00 08"
-    startmessage = "03 00 00 00 00 00 00 08"
+    initialmessage = ExataProtocolCodec.initialize_simulation(time_management_mode=0, coordinate_system=1)
+    pausemessage = ExataProtocolCodec.pause_simulation()
+    startmessage = ExataProtocolCodec.execute_simulation()
     initial_k = 1
-    over_controlmessage = ""
-    controlmessage = ""
+    over_controlmessage = b""
+    controlmessage = b""
+    stopmessage = b""
+    pending_stat_rename = False
     isPaused = False
     isStep = False
     hasbeenstep = False
@@ -6127,10 +6146,16 @@ class SocketView(View):
     isStep_lock = Lock()
     interval = 0
     now_time = 0
+    current_sim_time = 0.0
     final = 0
     continue_send = True
     frontshowisover = True
     exataisidle = False
+    frame_seq = 0
+    platforms_created = False
+    timeslice_control_active = False
+    link_calculator = None
+    last_enqueued_sim_time = None
     satellites = []
     # 以下参数和sgp4相关
     sat_arr = []  # 卫星列表
@@ -6149,7 +6174,7 @@ class SocketView(View):
     time_receive_link_state = []  #包含上个时间片内的全部链路数据包消息
     update_links = []
     json_list = []
-    message_prefixes = ['16000000000000', '07000000000000', '000000000000000a', '0e01000000', ]
+    missing_app_metadata_count = 0
 
     @staticmethod
     def set_isPaused(value):
@@ -6170,6 +6195,101 @@ class SocketView(View):
     def get_isStep():
         with SocketView.isStep_lock:
             return SocketView.isStep
+
+    @staticmethod
+    def reset_runtime_state():
+        with SocketView.send_queue_lock:
+            SocketView.send_queue = deque()
+        with SocketView.receive_queue_lock:
+            SocketView.receive_queue = deque()
+        SocketView.receive_buffer = b""
+        SocketView.runtime_state = ExataRuntimeStateMachine()
+        SocketView.state_event.clear()
+        SocketView.startSign = False
+        SocketView.pending_stat_rename = False
+        SocketView.stopmessage = b""
+        SocketView.controlmessage = b""
+        SocketView.over_controlmessage = b""
+        SocketView.now_time = 0
+        SocketView.current_sim_time = 0.0
+        SocketView.continue_send = True
+        SocketView.exataisidle = False
+        SocketView.frame_seq = 0
+        SocketView.platforms_created = False
+        SocketView.timeslice_control_active = False
+        SocketView.link_calculator = None
+        SocketView.last_enqueued_sim_time = None
+        SocketView.normal_node = []
+        SocketView.satellites = []
+        SocketView.update_links = []
+        SocketView.json_list = []
+        SocketView.receive_link_state = []
+        SocketView.missing_app_metadata_count = 0
+        SocketView.gene_read_send_thread = None
+        SocketView.stop_receive_message = 0
+        SocketView.stop_handle_message = 0
+        SocketView.stop_send_message = 0
+
+    @staticmethod
+    def enqueue_send(message: bytes):
+        if not message:
+            return
+        with SocketView.send_queue_lock:
+            SocketView.send_queue.append(message)
+
+    @staticmethod
+    def pop_next_send():
+        with SocketView.send_queue_lock:
+            if not SocketView.send_queue:
+                return None
+            return SocketView.send_queue.popleft()
+
+    @staticmethod
+    def enqueue_received(message):
+        with SocketView.receive_queue_lock:
+            SocketView.receive_queue.append(message)
+
+    @staticmethod
+    def pop_next_received():
+        with SocketView.receive_queue_lock:
+            if not SocketView.receive_queue:
+                return None
+            return SocketView.receive_queue.popleft()
+
+    @staticmethod
+    def wait_for_state(timeout=3):
+        return SocketView.state_event.wait(timeout)
+
+    @staticmethod
+    def _sync_runtime_flags():
+        SocketView.simulation_running = SocketView.runtime_state.phase in {
+            ExataRuntimePhase.RUNNING,
+            ExataRuntimePhase.STEPPING,
+            ExataRuntimePhase.INITIALIZED,
+        }
+        SocketView.set_isPaused(SocketView.runtime_state.phase == ExataRuntimePhase.PAUSED)
+
+    @staticmethod
+    def runtime_phase_value():
+        phase = SocketView.runtime_state.phase
+        return phase.value if hasattr(phase, "value") else str(phase)
+
+    def _control_payload(self, status, message):
+        return {
+            "status": status,
+            "message": message,
+            "runtime_phase": SocketView.runtime_phase_value(),
+            "sim_time": float(SocketView.current_sim_time),
+        }
+
+    def _control_response(self, status, message, *, http_status=200):
+        return JsonResponse(self._control_payload(status, message), status=http_status)
+
+    def _send_queue_payload_or_error(self):
+        send_result = SocketView.send_next_message(self)
+        if isinstance(send_result, dict) and send_result.get("status"):
+            return self._control_payload("error", send_result["status"])
+        return None
 
     def read_node_file(self) -> dict:
         """
@@ -6272,29 +6392,42 @@ class SocketView(View):
                     str_data = original_string.decode('utf-8')
                     split_values = str_data.split()
 
+                    if len(split_values) < 6:
+                        logger.warning(
+                            "Skipping malformed link-state payload with too few fields: %s",
+                            str_data,
+                        )
+                        continue
+
+                    base_payload = {
+                        "source_satellite_id": split_values[0],
+                        "destination_satellite_id": split_values[1],
+                        "source_satellite_interface": split_values[2],
+                        "destination_satellite_interface": split_values[3],
+                        "time": split_values[4],
+                    }
+
                     if split_values[5] == "0":
                         SocketView.receive_link_state.append({
-                            "source_satellite_id": split_values[0],
-                            "destination_satellite_id": split_values[1],
-                            "source_satellite_interface": split_values[2],
-                            "destination_satellite_interface": split_values[3],
-                            "time": split_values[4],
+                            **base_payload,
                             "type": "network_layer"
                         })
                     else:
+                        if len(split_values) < 9:
+                            logger.warning(
+                                "Skipping malformed application-layer payload with insufficient fields: %s",
+                                str_data,
+                            )
+                            continue
+
                         if split_values[0] == "4294967295":
                             print(f"str_data is :{str_data}")
                         SocketView.receive_link_state.append({
-                            "source_satellite_id": split_values[0],
-                            "destination_satellite_id": split_values[1],
-                            "source_satellite_interface": split_values[2],
-                            "destination_satellite_interface": split_values[3],
-                            "time": split_values[4],
+                            **base_payload,
                             "type": "application_layer",
                             "app_id": split_values[6],
                             "app_source_id": split_values[7],
                             "app_des_id": split_values[8],
-
                         })
 
                     # sendlinkstatetofrontbysocket(self, SocketView.receive_link_state[-1])
@@ -6722,7 +6855,7 @@ class SocketView(View):
         SocketView.send_queue = []
         SocketView.update_satellite_error_interface(self, absolute_path / "fault.txt")
         SocketView.update_satellite_print_link(self, SocketView.update_links, SocketView.satellites)
-        sendtofrontbysocket(self, int(SocketView.now_time) - int(SocketView.interval), SocketView.satellites,
+        sendtofrontbysocket(self, int(SocketView.now_time) + int(SocketView.interval), SocketView.satellites,
                             SocketView.json_list, applications)
         SocketView.receive_link_state = []
 
@@ -7774,4 +7907,956 @@ class SocketView(View):
             return {"status": "仿真已继续开始执行"}
         else:
             return {"status": "请不要重复开始，但你不应该看见这句话"}
+
+    def _select_node_snapshot(self, sim_time) -> list[dict]:
+        target_time = float(sim_time)
+        zero_rows: dict[str, dict] = {}
+        active_rows: dict[str, dict] = {}
+
+        with open(absolute_path / "node.txt", "r", encoding="utf-8") as file:
+            for raw in file:
+                if not raw.strip():
+                    continue
+
+                parts = raw.split()
+                node_id = parts[0]
+                node_time = float(parts[1])
+                lat, lon, alt = map(float, parts[2:5])
+                node_type = parts[5]
+                name = " ".join(parts[6:])
+
+                info = {
+                    "satellite_id": f"satellite_{node_id}",
+                    "time": node_time,
+                    "lat": str(lat),
+                    "lon": str(lon),
+                    "alt": str(alt),
+                    "type": node_type,
+                    "name": name,
+                }
+
+                if node_time == 0:
+                    zero_rows.setdefault(node_id, info)
+                elif node_time <= target_time and node_time > active_rows.get(node_id, {}).get("time", -1):
+                    active_rows[node_id] = info
+
+        final_nodes: dict[str, dict] = zero_rows.copy()
+        final_nodes.update(active_rows)
+        return sorted(final_nodes.values(), key=lambda item: int(item["satellite_id"].split("_")[1]))
+
+    def _build_satellite_payload(self, node_snapshot) -> list[dict]:
+        satellites = []
+        for info in node_snapshot:
+            satellites.append({
+                "satellite_id": info["satellite_id"],
+                "lat": info["lat"],
+                "lon": info["lon"],
+                "alt": info["alt"],
+                "type": info["type"],
+                "name": info["name"],
+                "error_interface": None,
+                "print_link": None,
+            })
+        return satellites
+
+    def _enqueue_platform_messages(self, sim_time, node_snapshot, create_platforms):
+        for info in node_snapshot:
+            entity_id = info["satellite_id"].split("_")[1]
+            lat = float(info["lat"])
+            lon = float(info["lon"])
+            alt = float(info["alt"])
+            if create_platforms:
+                SocketView.enqueue_send(
+                    ExataProtocolCodec.create_platform(
+                        entity_id=entity_id,
+                        lat=lat,
+                        lon=lon,
+                        alt=alt,
+                        damage_state=0,
+                        create_time=float(sim_time),
+                        platform_type=1,
+                    )
+                )
+            else:
+                SocketView.enqueue_send(
+                    ExataProtocolCodec.update_platform(
+                        entity_id=entity_id,
+                        update_time=float(sim_time),
+                        position=(lat, lon, alt),
+                        damage_state=0,
+                    )
+                )
+
+    def _prepare_link_state_for_time(self, sim_time):
+        if SocketView.link_calculator is None:
+            return
+        interval = int(float(SocketView.interval))
+        start_time = int(float(sim_time))
+        SocketView.link_calculator.read_static_link(start_time, start_time + interval)
+
+    def _queue_next_time_slice(self, sim_time):
+        target_time = float(sim_time)
+        if target_time > float(SocketView.final):
+            SocketView.continue_send = False
+            return False
+        if SocketView.last_enqueued_sim_time == target_time:
+            return True
+
+        node_snapshot = self._select_node_snapshot(target_time)
+        self._enqueue_platform_messages(target_time, node_snapshot, create_platforms=False)
+        self._prepare_link_state_for_time(target_time)
+        SocketView.enqueue_send(ExataProtocolCodec.advance_time(target_time))
+        SocketView.now_time = target_time
+        SocketView.last_enqueued_sim_time = target_time
+        return True
+
+    def _bootstrap_scene_runtime(self):
+        initial_file = absolute_path / "initial.txt"
+        self.read_initial_config(initial_file)
+        SocketView.current_sim_time = 0.0
+        SocketView.now_time = 0.0
+        SocketView.platforms_created = False
+        SocketView.last_enqueued_sim_time = None
+        SocketView.continue_send = True
+        SocketView.exataisidle = False
+        SocketView.receive_link_state = []
+        SocketView.link_calculator = StaticDynamicLinkCalculator(
+            input_filename=absolute_path / "link.txt",
+            config_filename=absolute_path / "config.txt",
+            output_filename=absolute_path / "config.txt",
+        )
+        self._prepare_link_state_for_time(0.0)
+
+    def _broadcast_runtime_snapshot(self, sim_time):
+        self.update_link_data(float(sim_time))
+
+    def _queue_initial_platforms(self):
+        if SocketView.platforms_created:
+            return
+        initial_snapshot = self._select_node_snapshot(0.0)
+        self._enqueue_platform_messages(0.0, initial_snapshot, create_platforms=True)
+        SocketView.platforms_created = True
+
+    def _shutdown_socket_threads(self):
+        SocketView.stop_receive_message = 1
+        SocketView.stop_handle_message = 1
+        if SocketView.client_socket is not None:
+            try:
+                SocketView.client_socket.close()
+            except OSError:
+                pass
+            finally:
+                SocketView.client_socket = None
+        if SocketView.receive_thread and SocketView.receive_thread.is_alive():
+            SocketView.receive_thread.join(timeout=1)
+        if SocketView.handle_thread and SocketView.handle_thread.is_alive():
+            SocketView.handle_thread.join(timeout=1)
+        SocketView.receive_thread = None
+        SocketView.handle_thread = None
+        SocketView.stop_receive_message = 0
+        SocketView.stop_handle_message = 0
+
+    def read_node_file(self, sim_time=None) -> dict:
+        if sim_time is None:
+            sim_time = SocketView.current_sim_time
+        SocketView.normal_node = self._select_node_snapshot(sim_time)
+        SocketView.satellites = self._build_satellite_payload(SocketView.normal_node)
+        return {"node": SocketView.normal_node}
+
+    def connect_to_server(self):
+        if (
+            SocketView.client_socket is not None
+            or (SocketView.receive_thread and SocketView.receive_thread.is_alive())
+            or (SocketView.handle_thread and SocketView.handle_thread.is_alive())
+        ):
+            self._shutdown_socket_threads()
+            time.sleep(1)
+        if SocketView.client_socket is not None:
+            try:
+                SocketView.client_socket.close()
+            except OSError:
+                pass
+            finally:
+                SocketView.client_socket = None
+            time.sleep(2)
+        if SocketView.client_socket is None:
+            server_address = EXATA_SERVICE_HOST
+            server_port = EXATA_SERVICE_PORT
+            SocketView.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            SocketView.client_socket.connect((server_address, server_port))
+            SocketView.runtime_state.on_connected()
+            SocketView._sync_runtime_flags()
+            SocketView.receive_thread = threading.Thread(target=self.receive_message, daemon=True)
+            SocketView.receive_thread.start()
+            SocketView.handle_thread = threading.Thread(target=self.handle_message, daemon=True)
+            SocketView.handle_thread.start()
+            print(f"成功连接: {SocketView.client_socket}")
+
+    def handle_message(self):
+        while True:
+            if SocketView.stop_handle_message == 1:
+                break
+            parsed_message = SocketView.pop_next_received()
+            if parsed_message is None:
+                time.sleep(0.05)
+                continue
+            self._process_incoming_message(parsed_message)
+
+    def _process_incoming_message(self, parsed_message):
+        SocketView.handleMessage = parsed_message.raw.hex()
+
+        if not parsed_message.is_standard and parsed_message.message_type == ExataMessageType.CUSTOM_LINK_STATE:
+            self._handle_custom_link_state(parsed_message)
+            return
+
+        if parsed_message.message_type == ExataMessageType.SIMULATION_STATE:
+            state = parsed_message.payload.get("state")
+            SocketView.runtime_state.on_simulation_state(state)
+            SocketView._sync_runtime_flags()
+            if state in {
+                ExataSimulationState.INITIALIZED,
+                ExataSimulationState.PAUSED,
+                ExataSimulationState.EXECUTING,
+            }:
+                SocketView.startSign = True
+                SocketView.state_event.set()
+            return
+
+        if parsed_message.message_type == ExataMessageType.SIMULATION_IDLE:
+            self._handle_idle_message(parsed_message)
+            return
+
+        if parsed_message.message_type == ExataMessageType.ERROR:
+            error_message = parsed_message.payload.get("error", "Unknown EXATA error")
+            logger.error("EXATA socket error: %s", error_message)
+            SocketView.runtime_state.on_error(error_message)
+            SocketView._sync_runtime_flags()
+            SocketView.state_event.set()
+            return
+
+        if parsed_message.message_type == ExataMessageType.DYNAMIC_RESPONSE:
+            logger.info(
+                "EXATA dynamic response type=%s path=%s output=%s",
+                parsed_message.payload.get("operation_type"),
+                parsed_message.payload.get("path"),
+                parsed_message.payload.get("output"),
+            )
+            return
+
+        if parsed_message.errors:
+            logger.warning(
+                "Unhandled EXATA message type=%s name=%s decode_errors=%s",
+                parsed_message.message_type,
+                parsed_message.name,
+                parsed_message.errors,
+            )
+
+    def _handle_custom_link_state(self, parsed_message):
+        for error in parsed_message.errors:
+            if error.startswith("Application-layer payload missing app metadata"):
+                SocketView.missing_app_metadata_count += 1
+                if (
+                    SocketView.missing_app_metadata_count == 1
+                    or SocketView.missing_app_metadata_count % 100 == 0
+                ):
+                    logger.info(
+                        "Custom 0x16 application-layer payload missing app metadata; count=%s latest_text=%s",
+                        SocketView.missing_app_metadata_count,
+                        parsed_message.payload.get("text", ""),
+                    )
+                continue
+            logger.warning(
+                "Custom 0x16 payload issue: %s; text=%s",
+                error,
+                parsed_message.payload.get("text", ""),
+            )
+
+        link_state = parsed_message.payload.get("link_state")
+        if link_state is not None:
+            SocketView.receive_link_state.append(link_state)
+
+    def _handle_idle_message(self, parsed_message):
+        current_time = parsed_message.payload.get("current_time")
+        if current_time is not None:
+            if not SocketView.timeslice_control_active:
+                SocketView.current_sim_time = float(current_time)
+                SocketView.now_time = float(current_time)
+                return
+            SocketView.runtime_state.on_idle(current_time)
+            SocketView.current_sim_time = float(current_time)
+            SocketView.now_time = float(current_time)
+
+        self.update_link_data(SocketView.current_sim_time)
+
+        if SocketView.current_sim_time >= float(SocketView.final):
+            SocketView.continue_send = False
+            SocketView.exataisidle = False
+            SocketView.set_isStep(False)
+            SocketView.send_stop_message(self, float(SocketView.final))
+            SocketView.send_next_message(self)
+        elif SocketView.get_isStep():
+            SocketView.exataisidle = False
+            SocketView.set_isStep(False)
+            SocketView.runtime_state.request_pause()
+            SocketView._sync_runtime_flags()
+            SocketView.enqueue_send(SocketView.pausemessage)
+            SocketView.enqueue_send(ExataProtocolCodec.query_simulation_state())
+            SocketView.send_next_message(self)
+        elif not SocketView.get_isPaused():
+            SocketView.exataisidle = True
+            next_time = SocketView.current_sim_time + float(SocketView.interval)
+            if self._queue_next_time_slice(next_time):
+                SocketView.send_next_message(self)
+            else:
+                SocketView.send_stop_message(self, float(SocketView.final))
+                SocketView.send_next_message(self)
+        SocketView.state_event.set()
+
+    def update_link_data(self, sim_time=None):
+        if sim_time is None:
+            sim_time = SocketView.current_sim_time
+        self.read_node_file(sim_time)
+
+        SocketView.update_links = [SocketView() for _ in range(len(StaticDynamicLinkCalculator.static_link))]
+
+        for idx, record in enumerate(StaticDynamicLinkCalculator.static_link):
+            link_id, time_value, node1, node2, interface1, interface2, ip1, ip2, link_type = record
+            update_link = SocketView.update_links[idx]
+            update_link.link_id = link_id
+            update_link.time = time_value
+            update_link.node1 = node1
+            update_link.node2 = node2
+            update_link.interface1 = interface1
+            update_link.interface2 = interface2
+            update_link.ip1 = ip1
+            update_link.ip2 = ip2
+            update_link.link_type = link_type
+            update_link.flag1 = 0
+            update_link.flag2 = 0
+            update_link.active_time1 = 0
+            update_link.active_time2 = 0
+            update_link.application_from_direction1 = 0
+            update_link.application_from_direction2 = 0
+            update_link.app_id1 = None
+            update_link.app_source_id1 = None
+            update_link.app_des_id1 = None
+            update_link.app_id2 = None
+            update_link.app_source_id2 = None
+            update_link.app_des_id2 = None
+            update_link.app_1 = None
+            update_link.app_2 = None
+
+        applications = []
+        with open("debug_log.txt", "a", encoding="utf-8") as f:
+            f.write(str(SocketView.receive_link_state) + "\n\n\n")
+
+        for receive_link_state_obj in SocketView.receive_link_state:
+            source_satellite_id = int(receive_link_state_obj["source_satellite_id"])
+            destination_satellite_id = int(receive_link_state_obj["destination_satellite_id"])
+            source_satellite_interface = int(receive_link_state_obj["source_satellite_interface"])
+            destination_satellite_interface = int(receive_link_state_obj["destination_satellite_interface"])
+            time_value = int(float(receive_link_state_obj["time"]))
+
+            if receive_link_state_obj["type"] == "network_layer":
+                for update_link in SocketView.update_links:
+                    node1 = int(update_link.node1)
+                    node2 = int(update_link.node2)
+                    interface1 = int(update_link.interface1)
+                    interface2 = int(update_link.interface2)
+
+                    if (
+                        node1 == source_satellite_id
+                        and node2 == destination_satellite_id
+                        and interface1 == source_satellite_interface
+                        and interface2 == destination_satellite_interface
+                    ):
+                        update_link.flag1 = 1
+                        update_link.active_time1 = time_value
+                    elif (
+                        node1 == destination_satellite_id
+                        and node2 == source_satellite_id
+                        and interface1 == destination_satellite_interface
+                        and interface2 == source_satellite_interface
+                    ):
+                        update_link.flag2 = 1
+                        update_link.active_time2 = time_value
+                continue
+
+            if receive_link_state_obj["type"] == "application_layer":
+                for update_link in SocketView.update_links:
+                    node1 = int(update_link.node1)
+                    node2 = int(update_link.node2)
+                    interface1 = int(update_link.interface1)
+                    interface2 = int(update_link.interface2)
+
+                    if (
+                        node1 == source_satellite_id
+                        and node2 == destination_satellite_id
+                        and interface1 == source_satellite_interface
+                        and interface2 == destination_satellite_interface
+                    ):
+                        update_link.application_from_direction1 += 1
+                        if all(
+                            receive_link_state_obj.get(key) not in (None, "")
+                            for key in ("app_id", "app_source_id", "app_des_id")
+                        ):
+                            app_1_info = {
+                                "app_id": str(receive_link_state_obj["app_id"]) + str(receive_link_state_obj["app_source_id"]),
+                                "app_source_id": str(receive_link_state_obj["app_source_id"]),
+                                "app_des_id": str(receive_link_state_obj["app_des_id"]),
+                            }
+                            if update_link.app_1:
+                                if not any(
+                                    app["app_id"] == app_1_info["app_id"]
+                                    and app["app_source_id"] == app_1_info["app_source_id"]
+                                    and app["app_des_id"] == app_1_info["app_des_id"]
+                                    for app in update_link.app_1
+                                ):
+                                    update_link.app_1.append(app_1_info)
+                            else:
+                                update_link.app_1 = [app_1_info]
+                    elif (
+                        node1 == destination_satellite_id
+                        and node2 == source_satellite_id
+                        and interface1 == destination_satellite_interface
+                        and interface2 == source_satellite_interface
+                    ):
+                        update_link.application_from_direction2 += 1
+                        if all(
+                            receive_link_state_obj.get(key) not in (None, "")
+                            for key in ("app_id", "app_source_id", "app_des_id")
+                        ):
+                            app_2_info = {
+                                "app_id": str(receive_link_state_obj["app_id"]) + str(receive_link_state_obj["app_source_id"]),
+                                "app_source_id": str(receive_link_state_obj["app_source_id"]),
+                                "app_des_id": str(receive_link_state_obj["app_des_id"]),
+                            }
+                            if update_link.app_2:
+                                if not any(
+                                    app["app_id"] == app_2_info["app_id"]
+                                    and app["app_source_id"] == app_2_info["app_source_id"]
+                                    and app["app_des_id"] == app_2_info["app_des_id"]
+                                    for app in update_link.app_2
+                                ):
+                                    update_link.app_2.append(app_2_info)
+                            else:
+                                update_link.app_2 = [app_2_info]
+
+                    if (
+                        (
+                            node1 == source_satellite_id
+                            and node2 == destination_satellite_id
+                            and interface1 == source_satellite_interface
+                            and interface2 == destination_satellite_interface
+                        )
+                        or (
+                            node1 == destination_satellite_id
+                            and node2 == source_satellite_id
+                            and interface1 == destination_satellite_interface
+                            and interface2 == source_satellite_interface
+                        )
+                    ):
+                        update_link.flag1 = 1
+                        update_link.active_time1 = time_value
+                        update_link.flag2 = 1
+                        update_link.active_time2 = time_value
+
+        SocketView.json_list = []
+
+        for update_link in SocketView.update_links:
+            link_id = update_link.link_id
+            time_value = update_link.time
+            node1 = update_link.node1
+            node2 = update_link.node2
+            link_type = int(update_link.link_type)
+            flag1 = update_link.flag1
+            flag2 = update_link.flag2
+
+            source_satellite = next((sat for sat in SocketView.satellites if sat["satellite_id"] == "satellite_" + str(node1)), None)
+            target_satellite = next((sat for sat in SocketView.satellites if sat["satellite_id"] == "satellite_" + str(node2)), None)
+            link_sat = []
+            if source_satellite is not None:
+                link_sat.append({
+                    "satellite_id": source_satellite["satellite_id"],
+                    "lat": source_satellite["lat"],
+                    "lon": source_satellite["lon"],
+                    "alt": source_satellite["alt"],
+                })
+            if target_satellite is not None:
+                link_sat.append({
+                    "satellite_id": target_satellite["satellite_id"],
+                    "lat": target_satellite["lat"],
+                    "lon": target_satellite["lon"],
+                    "alt": target_satellite["alt"],
+                })
+
+            if flag1 == 0 and flag2 == 0:
+                linkflag = 0
+            elif flag1 == 1 and flag2 == 0:
+                linkflag = 1
+            elif flag1 == 0 and flag2 == 1:
+                linkflag = 2
+            else:
+                linkflag = 3
+            if link_type == 1:
+                linkflag = 5
+            if link_type == 2:
+                linkflag = 4
+
+            SocketView.json_list.append({
+                "link_id": "link_" + str(link_id),
+                "link_time": time_value,
+                "link_sat": link_sat,
+                "link_flag": linkflag,
+            })
+            applications.append({
+                "application_sat": link_sat,
+                "application_from_direction1": update_link.application_from_direction1,
+                "application_from_direction2": update_link.application_from_direction2,
+                "link_flag": linkflag,
+                "app_1": update_link.app_1,
+                "app_2": update_link.app_2,
+            })
+
+        for normal_item in SocketView.normal_node:
+            normal_satellite_id = normal_item["satellite_id"]
+            normal_property = normal_item["type"]
+            normal_name = normal_item["name"]
+            for satellite in SocketView.satellites:
+                if satellite["satellite_id"] == normal_satellite_id:
+                    satellite["type"] = normal_property
+                    satellite["name"] = normal_name
+                    break
+
+        SocketView.update_satellite_error_interface(self, absolute_path / "fault.txt", sim_time)
+        SocketView.update_satellite_print_link(self, SocketView.update_links, SocketView.satellites)
+        sendtofrontbysocket(self, float(sim_time), SocketView.satellites, SocketView.json_list, applications)
+        SocketView.receive_link_state = []
+
+    def update_satellite_error_interface(self, fault_file_path, sim_time=None):
+        if sim_time is None:
+            sim_time = SocketView.current_sim_time
+        current_time = int(float(sim_time))
+
+        with open(fault_file_path, "r") as file:
+            for line in file:
+                parts = line.split()
+                node_id = int(parts[0])
+                interface_id = int(parts[1])
+                start_time = int(parts[2])
+                end_time = int(parts[3])
+
+                if start_time <= current_time <= end_time:
+                    for satellite in SocketView.satellites:
+                        satellite_id = int(satellite["satellite_id"].split("_")[1])
+                        if satellite_id == node_id:
+                            if satellite["error_interface"] is None:
+                                satellite["error_interface"] = []
+                            satellite["error_interface"].append({"interface_id": interface_id})
+
+    def receive_message(self):
+        while True:
+            try:
+                if SocketView.stop_receive_message == 1:
+                    break
+                response_data = SocketView.client_socket.recv(10000000)
+                if not response_data:
+                    logger.info("EXATA socket connection closed by peer")
+                    SocketView.runtime_state.on_disconnected()
+                    SocketView._sync_runtime_flags()
+                    break
+                SocketView.receive_buffer += response_data
+                try:
+                    frames, SocketView.receive_buffer = parse_exata_stream(SocketView.receive_buffer)
+                except ValueError as exc:
+                    logger.error(
+                        "Failed to parse EXATA socket stream: %s; buffer=%s",
+                        exc,
+                        SocketView.receive_buffer.hex(),
+                    )
+                    SocketView.receive_buffer = b""
+                    continue
+
+                for raw_message in frames:
+                    try:
+                        parsed_message = decode_exata_message(raw_message)
+                    except Exception as exc:
+                        logger.error(
+                            "Failed to decode EXATA message: %s; raw=%s",
+                            exc,
+                            raw_message.hex(),
+                        )
+                        continue
+                    SocketView.enqueue_received(parsed_message)
+            except socket.error as e:
+                print(f"接收失败: {e}")
+                SocketView.runtime_state.on_disconnected()
+                SocketView._sync_runtime_flags()
+                break
+
+    def _handle_connect_request(self, scene_id=None):
+        global absolute_path
+        global selected_scene_name
+
+        if scene_id not in (None, ""):
+            _, scene, scene_folder, error_response = _resolve_scene_runtime_context(scene_id)
+            if error_response:
+                return error_response
+            selected_scene_name = scene.sceneName
+            absolute_path = scene_folder
+
+        SocketView.reset_runtime_state()
+        SocketView.initial_k = 1
+        SocketView.i = 0
+        SocketView.ddk1 = 1
+        SocketView.ddk2 = 1
+        SocketView.handleMessage_queue = []
+        SocketView.sat_arr = []
+        SocketView.start_time = []
+        SocketView.print_state = 0
+        SocketView.stop_receive_message = 0
+        SocketView.stop_send_message = 0
+        SocketView.stop_handle_message = 0
+        SocketView.ip_list = []
+        SocketView.link_x = 1
+
+        if not selected_scene_name:
+            return JsonResponse({
+                "status": "error",
+                "message": "未选择场景，请先在场景列表中选择场景并进入仿真页面。",
+            }, status=400)
+
+        scene_path = absolute_path.resolve(strict=False)
+        required_files = [
+            scene_path / "orbit.txt",
+            scene_path / "node.txt",
+            scene_path / "initial.txt",
+        ]
+        missing_files = [file_path.name for file_path in required_files if not file_path.exists()]
+        if missing_files:
+            return JsonResponse({
+                "status": "error",
+                "message": (
+                    f"初始化失败，缺少场景文件: {', '.join(missing_files)}。"
+                    f"当前场景目录: {scene_path}"
+                ),
+            }, status=400)
+
+        try:
+            sat_init()
+        except FileNotFoundError as exc:
+            missing_name = Path(exc.filename).name if exc.filename else str(exc)
+            return JsonResponse({
+                "status": "error",
+                "message": (
+                    f"初始化失败，缺少必要文件: {missing_name}。"
+                    f"当前场景目录: {scene_path}"
+                ),
+            }, status=400)
+        except Exception as exc:
+            logger.error("Scene initialization failed during sat_init: %s", exc, exc_info=True)
+            return JsonResponse({
+                "status": "error",
+                "message": f"初始化失败，场景文件解析出错: {exc}",
+            }, status=500)
+
+        if not EXATA_MANAGED_EXTERNALLY:
+            exata = create_exata_simulator(
+                working_directory=absolute_path,
+                config_file=f"{selected_scene_name}.config",
+            )
+            exata.stop_simulation()
+            exata.run_simulation()
+            time.sleep(3)
+
+        try:
+            self.connect_to_server()
+        except ConnectionRefusedError:
+            return JsonResponse({
+                "status": "error",
+                "message": (
+                    f"初始化失败，无法连接 EXATA 服务 {EXATA_SERVICE_HOST}:{EXATA_SERVICE_PORT}。"
+                    "请确认 EXATA 已启动，且套接字端口可用。"
+                ),
+            }, status=502)
+        except OSError as exc:
+            logger.error("Scene initialization OS error: %s", exc, exc_info=True)
+            return JsonResponse({
+                "status": "error",
+                "message": f"初始化失败，连接 EXATA 时发生系统错误: {exc}",
+            }, status=500)
+
+        SocketView.message_indexStep = 0
+        SocketView.message_indexContinue = 0
+        SocketView.send_initialize_message(self)
+        SocketView.send_next_message(self)
+
+        if not SocketView.wait_for_state(timeout=5):
+            return self._control_response(
+                "error",
+                "Initialization finished without an EXATA state confirmation.",
+                http_status=500,
+            )
+
+        SocketView.runtime_state.phase = ExataRuntimePhase.INITIALIZED
+        SocketView._sync_runtime_flags()
+        self._bootstrap_scene_runtime()
+        self._broadcast_runtime_snapshot(0.0)
+        return self._control_response("success", "Initialization completed.")
+
+    def _handle_start_request(self):
+        if SocketView.client_socket is None:
+            return self._control_response(
+                "error",
+                "EXATA socket is not connected. Initialize the scene first.",
+                http_status=409,
+            )
+        if SocketView.runtime_state.phase != ExataRuntimePhase.INITIALIZED:
+            return self._control_response(
+                "error",
+                f"Simulation can only start from the initialized state, current={SocketView.runtime_phase_value()}.",
+                http_status=409,
+            )
+        if (
+            SocketView.gene_read_send_thread is not None
+            and SocketView.gene_read_send_thread.is_alive()
+        ):
+            return self._control_response(
+                "error",
+                "Simulation startup is already running.",
+                http_status=409,
+            )
+
+        SocketView.state_event.clear()
+        SocketView.set_isStep(False)
+        SocketView.continue_send = True
+        SocketView.exataisidle = False
+        SocketView.timeslice_control_active = True
+        SocketView.runtime_state.request_continue()
+        SocketView._sync_runtime_flags()
+        SocketView.send_start_message(self)
+        SocketView.gene_read_send_thread = threading.Thread(
+            target=self.gene_read_send_message,
+            args=(absolute_path,),
+            daemon=True,
+        )
+        SocketView.gene_read_send_thread.start()
+        return self._control_response("success", "Simulation started.")
+
+    @csrf_exempt
+    def post(self, request):
+        content_type = request.META.get("CONTENT_TYPE")
+        if content_type == "application/json":
+            data = json.loads(request.body or "{}")
+            route_key = request.path.rstrip("/").split("/")[-1]
+            if route_key == "connect" or "connect" in data:
+                return self._handle_connect_request(data.get("sceneId"))
+            if route_key == "send-simulation-message" or "sendsimulationmessage" in data:
+                return self._handle_start_request()
+            if route_key == "pause-simulation" or "pausesimulation" in data:
+                payload = self.pause_simulation()
+                status_code = 200 if payload.get("status") == "success" else 409
+                return JsonResponse(payload, status=status_code)
+            if route_key == "continue-simulation" or "continuesimulation" in data:
+                payload = self.continue_simulation()
+                status_code = 200 if payload.get("status") == "success" else 409
+                return JsonResponse(payload, status=status_code)
+            if route_key == "step-simulation" or "stepsimulation" in data:
+                payload = self.step_simulation()
+                status_code = 200 if payload.get("status") == "success" else 409
+                return JsonResponse(payload, status=status_code)
+            if route_key == "stop-simulation" or "stopsimulation" in data:
+                payload = self.stop_simulation()
+                status_code = 200 if payload.get("status") == "success" else 500
+                return JsonResponse(payload, status=status_code)
+        return JsonResponse({"status": "error", "message": "Unsupported request"}, status=400)
+
+    @csrf_exempt
+    def stop_simulation(self):
+        if SocketView.client_socket is not None:
+            SocketView.send_stop_message(self, float(SocketView.current_sim_time))
+            SocketView.send_next_message(self)
+        self._shutdown_socket_threads()
+        if not EXATA_MANAGED_EXTERNALLY:
+            try:
+                exata = create_exata_simulator(
+                    working_directory=absolute_path,
+                    config_file=f"{selected_scene_name}.config",
+                )
+                exata.stop_simulation()
+            except Exception as exc:
+                logger.warning("Failed to stop EXATA process cleanly: %s", exc)
+
+        SocketView.reset_runtime_state()
+        SocketView.runtime_state.phase = ExataRuntimePhase.COMPLETED
+        SocketView.timeslice_control_active = False
+        SocketView._sync_runtime_flags()
+        return self._control_payload("success", "Simulation stopped.")
+
+    def gene_read_send_message(self, current_path):
+        try:
+            initial_file = current_path / "initial.txt"
+            self.read_initial_config(initial_file)
+            SocketView.current_sim_time = 0.0
+            SocketView.now_time = 0.0
+            SocketView.platforms_created = False
+            SocketView.link_calculator = StaticDynamicLinkCalculator(
+                input_filename=current_path / "link.txt",
+                config_filename=current_path / "config.txt",
+                output_filename=current_path / "config.txt",
+            )
+            self._queue_initial_platforms()
+
+            first_time = float(SocketView.interval)
+            if first_time <= float(SocketView.final):
+                self._queue_next_time_slice(first_time)
+            else:
+                SocketView.continue_send = False
+
+            self.send_next_message()
+            return
+        finally:
+            SocketView.gene_read_send_thread = None
+
+    def read_initial_config(self, initial_file):
+        global absolute_path
+        try:
+            with open(initial_file, "r") as file:
+                print("intial absolute path" + str(initial_file))
+                lines = file.readlines()
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    command_parts = line.strip().split()
+                    command = command_parts[0]
+                    if command == "INTERVAL":
+                        SocketView.interval = command_parts[1]
+                    if command == "FINAL":
+                        SocketView.final = command_parts[1]
+        except Exception as e:
+            print(f"读取消息文件失败: {e}")
+
+    def send_initialize_message(self):
+        SocketView.state_event.clear()
+        SocketView.enqueue_send(SocketView.initialmessage)
+        SocketView.enqueue_send(ExataProtocolCodec.query_simulation_state())
+
+    def send_start_message(self):
+        SocketView.state_event.clear()
+        SocketView.enqueue_send(SocketView.startmessage)
+        SocketView.enqueue_send(ExataProtocolCodec.query_simulation_state())
+
+    def send_control_message(self, interval, finaltime):
+        SocketView.now_time = SocketView.now_time + interval
+        if SocketView.now_time >= finaltime:
+            SocketView.continue_send = False
+        else:
+            controlmessage = ExataProtocolCodec.advance_time(SocketView.now_time)
+            SocketView.controlmessage = controlmessage
+            SocketView.enqueue_send(controlmessage)
+            print(f"simulaiton time is {SocketView.now_time}")
+
+    def send_stop_message(self, finaltime):
+        SocketView.stopmessage = ExataProtocolCodec.stop_simulation(finaltime)
+        SocketView.pending_stat_rename = True
+        SocketView.runtime_state.request_stop()
+        SocketView._sync_runtime_flags()
+        SocketView.enqueue_send(SocketView.stopmessage)
+
+    def send_next_message(self):
+        """发送队列中的下一条消息"""
+        if SocketView.client_socket is None:
+            logger.error("Cannot send EXATA messages: client socket is not connected")
+            SocketView.runtime_state.on_disconnected()
+            SocketView._sync_runtime_flags()
+            return {"status": "发送失败: EXATA socket 未连接"}
+        with SocketView.send_lock:
+            while True:
+                message = SocketView.pop_next_send()
+                if message is None:
+                    break
+
+                if message[:1] == bytes([ExataMessageType.ADVANCE_TIME]):
+                    time.sleep(0.5)
+                try:
+                    SocketView.client_socket.sendall(message)
+                    SocketView.message_indexContinue += 1
+                    if message == SocketView.stopmessage and SocketView.pending_stat_rename:
+                        time.sleep(3)
+                        SocketView.rename_stat_file_to_current_time(absolute_path)
+                        SocketView.pending_stat_rename = False
+                        SocketView.stopmessage = b""
+                except socket.error as e:
+                    return {"status": f"发送失败: {e}"}
+
+    @csrf_exempt
+    def pause_simulation(self):
+        if SocketView.runtime_state.phase != ExataRuntimePhase.RUNNING:
+            return self._control_payload(
+                "error",
+                f"Pause is only allowed while running, current={SocketView.runtime_phase_value()}.",
+            )
+        SocketView.state_event.clear()
+        SocketView.runtime_state.request_pause()
+        SocketView.enqueue_send(SocketView.pausemessage)
+        SocketView.enqueue_send(ExataProtocolCodec.query_simulation_state())
+        error_payload = self._send_queue_payload_or_error()
+        if error_payload is not None:
+            return error_payload
+        SocketView.wait_for_state(timeout=3)
+        SocketView._sync_runtime_flags()
+        return self._control_payload("success", "Simulation paused.")
+
+    @csrf_exempt
+    def continue_simulation(self):
+        if SocketView.runtime_state.phase != ExataRuntimePhase.PAUSED:
+            return self._control_payload(
+                "error",
+                f"Continue is only allowed while paused, current={SocketView.runtime_phase_value()}.",
+            )
+        next_time = SocketView.current_sim_time + float(SocketView.interval)
+        if next_time > float(SocketView.final):
+            return self._control_payload("error", "Simulation is already at the final timeslice.")
+        SocketView.state_event.clear()
+        SocketView.set_isStep(False)
+        SocketView.timeslice_control_active = True
+        SocketView.runtime_state.request_continue()
+        SocketView._sync_runtime_flags()
+        SocketView.send_start_message(self)
+        self._queue_next_time_slice(next_time)
+        error_payload = self._send_queue_payload_or_error()
+        if error_payload is not None:
+            return error_payload
+        SocketView.wait_for_state(timeout=3)
+        SocketView._sync_runtime_flags()
+        return self._control_payload("success", "Simulation continued.")
+
+    @csrf_exempt
+    def step_simulation(self):
+        if SocketView.runtime_state.phase not in {
+            ExataRuntimePhase.PAUSED,
+            ExataRuntimePhase.INITIALIZED,
+        }:
+            return self._control_payload(
+                "error",
+                f"Step is only allowed while initialized or paused, current={SocketView.runtime_phase_value()}.",
+            )
+        next_time = SocketView.current_sim_time + float(SocketView.interval)
+        if next_time > float(SocketView.final):
+            return self._control_payload("error", "Simulation is already at the final timeslice.")
+        SocketView.state_event.clear()
+        SocketView.timeslice_control_active = True
+        SocketView.runtime_state.request_step()
+        SocketView.set_isPaused(False)
+        SocketView.set_isStep(True)
+        SocketView.hasbeenstep = False
+        if not SocketView.platforms_created:
+            self._queue_initial_platforms()
+        SocketView.send_start_message(self)
+        self._queue_next_time_slice(next_time)
+        error_payload = self._send_queue_payload_or_error()
+        if error_payload is not None:
+            return error_payload
+        SocketView._sync_runtime_flags()
+        return self._control_payload("success", "Simulation advanced by one timeslice.")
 

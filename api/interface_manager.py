@@ -1,6 +1,7 @@
 import ipaddress
 
 from django.db.models import Max
+from django.db import transaction
 
 from .models import Interface,Subnet
 
@@ -68,3 +69,55 @@ def create_new_interface(node):
     default_subnet.interfaces.add(new_interface)
 
     return new_interface
+
+
+@transaction.atomic
+def reorder_interfaces_by_scene(scene_id):
+    """Keep subnet interfaces before link interfaces for every node in a scene."""
+    if scene_id in [None, '']:
+        return
+
+    interfaces = list(
+        Interface.objects.select_for_update()
+        .filter(node__sceneId_id=scene_id)
+        .select_related('node')
+        .order_by('node_id', 'interfaceType', 'interfaceIndex', 'id')
+    )
+    if not interfaces:
+        return
+
+    interfaces_by_node = {}
+    for interface in interfaces:
+        interfaces_by_node.setdefault(interface.node_id, []).append(interface)
+
+    priority = {
+        Interface.InterfaceTypeChoices.SUB: 0,
+        Interface.InterfaceTypeChoices.LINK: 1,
+    }
+
+    pending_updates = []
+    for node_interfaces in interfaces_by_node.values():
+        ordered = sorted(
+            node_interfaces,
+            key=lambda item: (
+                priority.get(item.interfaceType, 99),
+                item.interfaceIndex if item.interfaceIndex is not None else 10**9,
+                item.id,
+            ),
+        )
+
+        for next_index, interface in enumerate(ordered):
+            if interface.interfaceIndex != next_index:
+                pending_updates.append((interface, next_index))
+
+    if not pending_updates:
+        return
+
+    # Use temporary negative indexes first to avoid unique_together conflicts.
+    for offset, (interface, _) in enumerate(pending_updates, start=1):
+        interface.interfaceIndex = -offset
+        interface.save(update_fields=['interfaceIndex'])
+
+    for interface, next_index in pending_updates:
+        interface.interfaceIndex = next_index
+        interface.save(update_fields=['interfaceIndex'])
